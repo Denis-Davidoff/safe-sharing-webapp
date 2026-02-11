@@ -15,6 +15,9 @@ import {
   type Attachment,
   type MessagePayload,
 } from './crypto'
+import DbSettings from './components/DbSettings.vue'
+import { useSupabase } from './composables/useSupabase'
+import type { DbMessageRow } from './types/db'
 
 // ─── State ───────────────────────────────────────────────────────
 
@@ -97,6 +100,74 @@ const statusText = computed(() => {
 const canEncrypt = computed(() => {
   return attachments.length > 0 || plaintextInput.value.trim().length > 0
 })
+
+// ─── Supabase ────────────────────────────────────────────────────
+
+const fingerprint = computed(() => {
+  if (!keyPair.value) return ''
+  return encodeBase64(keyPair.value.publicKey).slice(0, 8)
+})
+
+const db = useSupabase({
+  fingerprint,
+  onMessages: handleDbMessages,
+})
+
+function handleDbMessages(rows: DbMessageRow[]) {
+  if (!recvChain.value || !ourRatchetKeyPair.value) return
+
+  for (const row of rows) {
+    try {
+      const envelope = JSON.parse(typeof row.data === 'string' ? row.data : JSON.stringify(row.data))
+      const encryptedData: string = envelope.d
+
+      const msgNum = recvMessageCount.value + 1
+      console.log('═══════════════════════════════════════════')
+      console.log(`[DB-Recv #${msgNum}] Auto-decrypting from Supabase...`)
+      console.log('═══════════════════════════════════════════')
+
+      // 1. Symmetric ratchet
+      const { nextChainKey, messageKey } = ratchetStep(recvChain.value)
+
+      // 2. Decrypt
+      const payload = decryptMessage(messageKey, encryptedData)
+      if (!payload) {
+        console.error(`[DB-Recv #${msgNum}] Decryption FAILED — skipping`)
+        db.deleteMessage(row.pk)
+        continue
+      }
+
+      console.log('[DB-Recv] Decrypted JSON payload:', JSON.stringify(payload, null, 2))
+
+      // 3. DH ratchet
+      const peerNewRatchetPub = decodeBase64(payload.ratchetKey)
+      recvChain.value = dhRatchet(nextChainKey, ourRatchetKeyPair.value.secretKey, peerNewRatchetPub)
+      peerRatchetPublic.value = peerNewRatchetPub
+      recvMessageCount.value = msgNum
+
+      // 4. Build result and add to history
+      const resultAttachments = payload.attachments?.map(a => {
+        const bytes = base64ToBytes(a.data)
+        const blob = new Blob([bytes.buffer as ArrayBuffer], { type: a.mime })
+        return { type: a.type, blobUrl: createBlobUrl(blob) }
+      })
+
+      messages.push({
+        direction: 'received',
+        text: payload.text,
+        attachments: resultAttachments,
+      })
+
+      console.log(`[DB-Recv #${msgNum}] Decrypted and added to history`)
+
+      // 5. Delete from DB
+      db.deleteMessage(row.pk)
+    } catch (err: any) {
+      console.error('[DB-Recv] Error processing message:', err.message)
+      db.deleteMessage(row.pk)
+    }
+  }
+}
 
 // ─── Handshake ───────────────────────────────────────────────────
 
@@ -346,7 +417,14 @@ function encrypt() {
     attachments: historyAttachments.length > 0 ? historyAttachments : undefined,
   })
 
-  // 7. Clear inputs
+  // 7. Auto-send to Supabase if configured
+  if (db.isConfigured.value) {
+    db.sendMessage(encrypted).then(ok => {
+      if (ok) console.log(`[Send #${msgNum}] Auto-sent to Supabase`)
+    })
+  }
+
+  // 8. Clear inputs
   plaintextInput.value = ''
   attachments.length = 0
   console.log(`[Send #${msgNum}] Done — copy the encrypted output`)
@@ -449,6 +527,7 @@ function resetAll() {
   attachments.length = 0
   messages.length = 0
   stopRecording()
+  db.stopSync()
   blobUrls.forEach(url => URL.revokeObjectURL(url))
   blobUrls.length = 0
   console.log('[Reset] All state cleared')
@@ -456,18 +535,44 @@ function resetAll() {
 
 onBeforeUnmount(() => {
   stopRecording()
+  db.stopSync()
   blobUrls.forEach(url => URL.revokeObjectURL(url))
 })
 </script>
 
 <template>
   <div class="min-h-screen bg-gray-950 text-gray-100 flex flex-col items-center p-4 sm:p-6">
+
+    <!-- Supabase Settings Panel -->
+    <DbSettings
+      :settings="db.settings.value"
+      :connection-state="db.connectionState.value"
+      :connection-error="db.connectionError.value"
+      :is-connected="db.isConnected.value"
+      :is-configured="db.isConfigured.value"
+      :is-syncing="db.isSyncing.value"
+      :is-listening="db.isListening.value"
+      :tables="db.tables.value"
+      :columns="db.columns.value"
+      :can-sync="phase === 'ready'"
+      @connect="db.connect"
+      @disconnect="db.disconnect"
+      @start-sync="db.startSync"
+      @stop-sync="db.stopSync"
+      @update:settings="(s: any) => Object.assign(db.settings.value, s)"
+      @fetch-columns="db.fetchColumns"
+    />
+
     <div class="w-full max-w-2xl space-y-6">
 
       <!-- Header -->
       <div class="text-center space-y-2">
         <h1 class="text-3xl font-bold tracking-tight">XChat</h1>
-        <p class="text-sm text-gray-400">E2E encrypted · Curve25519 · Double Ratchet</p>
+        <p class="text-sm text-gray-400">
+          E2E encrypted · Curve25519 · Double Ratchet
+          <span v-if="db.isListening.value" class="text-emerald-400"> · Realtime sync</span>
+          <span v-else-if="db.isSyncing.value" class="text-yellow-400"> · Polling sync</span>
+        </p>
         <div class="inline-block px-3 py-1 rounded-full text-xs font-medium"
           :class="{
             'bg-gray-800 text-gray-400': phase === 'idle',
