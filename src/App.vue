@@ -45,6 +45,9 @@ const peerPublicKeyInput = ref('')
 const plaintextInput = ref('')
 const encryptedOutput = ref('')
 const peerEncryptedInput = ref('')
+const joinMode = ref(false)
+const joinResponseCode = ref('')
+const connectionMode = ref<'manual' | 'supabase'>('manual')
 
 // Attachments (multiple)
 interface UIAttachment {
@@ -109,8 +112,8 @@ function onInputKeydown(e: KeyboardEvent) {
 
 const statusText = computed(() => {
   switch (phase.value) {
-    case 'idle': return 'Click "Generate Keys" to start handshake'
-    case 'waiting': return 'Exchange public keys with your peer'
+    case 'idle': return joinMode.value ? 'Paste invite code to join' : 'Create or join a chat'
+    case 'waiting': return 'Send invite code to your peer'
     case 'ready': return 'Secure channel established — send encrypted messages'
   }
 })
@@ -229,9 +232,56 @@ function completeHandshake() {
 
     console.log('[Phase 3] Secure channel established!')
     console.log('[Phase 3] DH ratchet initialized with identity keys.')
+
+    // Start Supabase message sync if configured
+    if (db.isConfigured.value && !db.isSyncing.value) {
+      db.startSync()
+    }
   } catch (e) {
     console.error('[Handshake] Error:', e)
     alert('Invalid public key format.')
+  }
+}
+
+function joinChat() {
+  if (!peerPublicKeyInput.value.trim()) return
+
+  console.log('═══════════════════════════════════════════')
+  console.log('[Join] Generating keys and completing handshake...')
+  console.log('═══════════════════════════════════════════')
+
+  try {
+    // 1. Generate our keys
+    keyPair.value = generateKeyPair()
+
+    // 2. Complete handshake with peer's invite key
+    const theirPub = decodeBase64(peerPublicKeyInput.value.trim())
+    peerPublicKey.value = theirPub
+
+    const shared = computeSharedSecret(keyPair.value.secretKey, theirPub)
+    const chains = deriveChainKeys(shared, keyPair.value.publicKey, theirPub)
+    sendChain.value = chains.sendChain
+    recvChain.value = chains.recvChain
+
+    ourRatchetKeyPair.value = { publicKey: keyPair.value.publicKey, secretKey: keyPair.value.secretKey }
+    peerRatchetPublic.value = theirPub
+
+    // 3. Store response code for user to copy back
+    joinResponseCode.value = encodeBase64(keyPair.value.publicKey)
+
+    // 4. Start Supabase sync if configured
+    if (db.isConfigured.value && !db.isSyncing.value) {
+      db.startSync()
+    }
+
+    // 5. Go to ready (joiner has both keys)
+    phase.value = 'ready'
+    joinMode.value = false
+
+    console.log('[Join] Secure channel established! Response code ready to copy.')
+  } catch (e) {
+    console.error('[Join] Error:', e)
+    alert('Invalid invite code format.')
   }
 }
 
@@ -542,6 +592,9 @@ function resetAll() {
   encryptedOutput.value = ''
   peerEncryptedInput.value = ''
   decryptedResult.value = null
+  joinMode.value = false
+  joinResponseCode.value = ''
+  connectionMode.value = 'manual'
   attachments.length = 0
   messages.length = 0
   stopRecording()
@@ -572,7 +625,7 @@ onBeforeUnmount(() => {
       :is-listening="db.isListening.value"
       :tables="db.tables.value"
       :columns="db.columns.value"
-      :can-sync="phase === 'ready'"
+      :can-sync="phase === 'ready' || phase === 'waiting'"
       @connect="db.connect"
       @disconnect="db.disconnect"
       @start-sync="db.startSync"
@@ -604,16 +657,186 @@ onBeforeUnmount(() => {
       <div class="w-full max-w-lg space-y-4 bg-gray-900 rounded-xl p-5 border border-gray-800">
         <h2 class="text-lg font-semibold">Key Exchange (ECDH · Curve25519)</h2>
 
-        <div v-if="phase === 'idle'">
-          <button @click="startHandshake"
-            class="w-full py-2.5 px-4 bg-blue-600 hover:bg-blue-500 rounded-lg font-medium transition-colors cursor-pointer">
-            Generate Keys
+        <!-- idle: choice screen -->
+        <div v-if="phase === 'idle' && !joinMode" class="space-y-4">
+
+          <!-- Mode tabs -->
+          <div class="flex rounded-lg bg-gray-800 p-0.5">
+            <button @click="connectionMode = 'manual'"
+              :class="connectionMode === 'manual' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-gray-200'"
+              class="flex-1 py-1.5 text-sm font-medium rounded-md transition-colors cursor-pointer">
+              Copy / Paste
+            </button>
+            <button @click="connectionMode = 'supabase'; joinMode = false"
+              :class="connectionMode === 'supabase' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-gray-200'"
+              class="flex-1 py-1.5 text-sm font-medium rounded-md transition-colors cursor-pointer">
+              Supabase
+            </button>
+          </div>
+
+          <!-- ── Manual mode ── -->
+          <template v-if="connectionMode === 'manual'">
+            <button @click="startHandshake"
+              class="w-full py-2.5 px-4 bg-blue-600 hover:bg-blue-500 rounded-lg font-medium transition-colors cursor-pointer">
+              Create New Chat
+            </button>
+            <div class="text-center text-sm text-gray-500">or</div>
+            <button @click="joinMode = true"
+              class="w-full py-2.5 px-4 bg-gray-700 hover:bg-gray-600 rounded-lg font-medium transition-colors cursor-pointer">
+              Join Existing Chat
+            </button>
+          </template>
+
+          <!-- ── Supabase mode ── -->
+          <template v-else>
+
+            <!-- Step 1: Connect (not connected yet) -->
+            <template v-if="!db.isConnected.value">
+              <div class="space-y-1">
+                <label class="block text-xs text-gray-400">Supabase URL</label>
+                <input type="text"
+                  :value="db.settings.value.url"
+                  @input="db.settings.value.url = ($event.target as HTMLInputElement).value"
+                  placeholder="https://xxx.supabase.co"
+                  class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500" />
+              </div>
+              <div class="space-y-1">
+                <label class="block text-xs text-gray-400">Anon Key</label>
+                <input type="password"
+                  :value="db.settings.value.anonKey"
+                  @input="db.settings.value.anonKey = ($event.target as HTMLInputElement).value"
+                  placeholder="eyJhbGciOiJIUzI1NiIs..."
+                  class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-blue-500" />
+              </div>
+              <div v-if="db.connectionError.value" class="text-xs text-red-400 bg-red-900/20 rounded-lg p-2">
+                {{ db.connectionError.value }}
+              </div>
+              <button @click="db.connect"
+                :disabled="!db.settings.value.url || !db.settings.value.anonKey || db.connectionState.value === 'connecting'"
+                class="w-full py-2.5 px-4 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg font-medium transition-colors cursor-pointer disabled:cursor-not-allowed">
+                {{ db.connectionState.value === 'connecting' ? 'Connecting...' : 'Connect' }}
+              </button>
+            </template>
+
+            <!-- Step 2: Configure table/column (connected but not configured) -->
+            <template v-else-if="!db.isConfigured.value">
+              <div class="flex items-center justify-between">
+                <div class="flex items-center gap-2 text-sm text-green-400">
+                  <span class="w-2 h-2 rounded-full bg-green-500" />
+                  Connected
+                </div>
+                <button @click="db.disconnect" class="text-xs text-gray-500 hover:text-gray-300 transition-colors cursor-pointer">
+                  Disconnect
+                </button>
+              </div>
+
+              <div class="space-y-1">
+                <label class="block text-xs text-gray-400">Table</label>
+                <select v-if="db.tables.value.length > 0"
+                  :value="db.settings.value.table"
+                  @change="db.settings.value.table = ($event.target as HTMLSelectElement).value; db.fetchColumns(db.settings.value.table)"
+                  class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500">
+                  <option value="">-- select table --</option>
+                  <option v-for="t in db.tables.value" :key="t" :value="t">{{ t }}</option>
+                </select>
+                <input v-else type="text"
+                  :value="db.settings.value.table"
+                  @input="db.settings.value.table = ($event.target as HTMLInputElement).value"
+                  @change="db.fetchColumns(db.settings.value.table)"
+                  placeholder="messages"
+                  class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500" />
+              </div>
+
+              <div class="space-y-1">
+                <label class="block text-xs text-gray-400">Message column</label>
+                <select v-if="db.columns.value.length > 0"
+                  :value="db.settings.value.column"
+                  @change="db.settings.value.column = ($event.target as HTMLSelectElement).value"
+                  class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500">
+                  <option value="">-- select column --</option>
+                  <option v-for="c in db.columns.value" :key="c" :value="c">{{ c }}</option>
+                </select>
+                <input v-else type="text"
+                  :value="db.settings.value.column"
+                  @input="db.settings.value.column = ($event.target as HTMLInputElement).value"
+                  placeholder="payload"
+                  class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500" />
+              </div>
+
+              <div class="space-y-1">
+                <label class="block text-xs text-gray-400">ID column</label>
+                <input type="text"
+                  :value="db.settings.value.idColumn"
+                  @input="db.settings.value.idColumn = ($event.target as HTMLInputElement).value"
+                  placeholder="id"
+                  class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500" />
+              </div>
+            </template>
+
+            <!-- Step 3: Ready — create/join chat -->
+            <template v-else>
+              <div class="flex items-center justify-between">
+                <div class="flex items-center gap-2 text-sm text-green-400">
+                  <span class="w-2 h-2 rounded-full bg-green-500" />
+                  {{ db.settings.value.table }} · {{ db.settings.value.column }}
+                </div>
+                <button @click="db.disconnect" class="text-xs text-gray-500 hover:text-gray-300 transition-colors cursor-pointer">
+                  Disconnect
+                </button>
+              </div>
+
+              <button @click="startHandshake"
+                class="w-full py-2.5 px-4 bg-blue-600 hover:bg-blue-500 rounded-lg font-medium transition-colors cursor-pointer">
+                Create New Chat
+              </button>
+              <div class="text-center text-sm text-gray-500">or</div>
+              <button @click="joinMode = true"
+                class="w-full py-2.5 px-4 bg-gray-700 hover:bg-gray-600 rounded-lg font-medium transition-colors cursor-pointer">
+                Join Existing Chat
+              </button>
+              <p class="text-center text-xs text-gray-500">Messages will be delivered via Supabase after key exchange</p>
+            </template>
+
+          </template>
+        </div>
+
+        <!-- idle + joinMode: paste invite -->
+        <div v-if="phase === 'idle' && joinMode" class="space-y-4">
+          <div class="flex items-center gap-2">
+            <button @click="joinMode = false"
+              class="text-sm text-gray-400 hover:text-gray-200 transition-colors cursor-pointer">
+              &larr; Back
+            </button>
+            <h3 class="text-sm font-medium">Join Chat</h3>
+          </div>
+
+          <div class="space-y-1.5">
+            <label class="block text-sm text-gray-400">Paste Invite Code</label>
+            <div class="flex gap-2">
+              <textarea
+                v-model="peerPublicKeyInput"
+                placeholder="Paste invite code from your partner..."
+                class="flex-1 bg-gray-800 border border-gray-700 rounded-lg p-3 text-sm font-mono resize-none h-20 focus:outline-none focus:border-green-500"
+              />
+              <button
+                @click="pasteFromClipboard('peerKey')"
+                class="px-4 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm font-medium transition-colors shrink-0 cursor-pointer">
+                Paste
+              </button>
+            </div>
+          </div>
+
+          <button @click="joinChat"
+            :disabled="!peerPublicKeyInput.trim()"
+            class="w-full py-2.5 px-4 bg-green-600 hover:bg-green-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg font-medium transition-colors cursor-pointer disabled:cursor-not-allowed">
+            Join
           </button>
         </div>
 
+        <!-- waiting: initiator view (always manual key exchange) -->
         <div v-if="phase === 'waiting'" class="space-y-4">
           <div class="space-y-1.5">
-            <label class="block text-sm text-gray-400">Your Public Key</label>
+            <label class="block text-sm text-gray-400">Your Invite Code</label>
             <div class="flex gap-2">
               <textarea readonly
                 :value="keyPair ? encodeBase64(keyPair.publicKey) : ''"
@@ -625,14 +848,15 @@ onBeforeUnmount(() => {
                 Copy
               </button>
             </div>
+            <p class="text-xs text-gray-500">Send this invite code to your chat partner</p>
           </div>
 
           <div class="space-y-1.5">
-            <label class="block text-sm text-gray-400">Peer's Public Key</label>
+            <label class="block text-sm text-gray-400">Paste Partner's Response</label>
             <div class="flex gap-2">
               <textarea
                 v-model="peerPublicKeyInput"
-                placeholder="Paste peer's public key here..."
+                placeholder="Paste response code from your partner..."
                 class="flex-1 bg-gray-800 border border-gray-700 rounded-lg p-3 text-sm font-mono resize-none h-16 focus:outline-none focus:border-blue-500"
               />
               <button
@@ -652,8 +876,27 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
-    <!-- ═══ Split Layout (when ready) ═══ -->
-    <div v-else class="flex-1 flex flex-col lg:flex-row min-h-0">
+    <!-- ═══ Chat View (when ready) ═══ -->
+    <template v-else>
+
+      <!-- Response code banner (shown after joining, dismissible) -->
+      <div v-if="joinResponseCode" class="bg-yellow-900/30 border-b border-yellow-800 px-4 py-3 shrink-0">
+        <p class="text-sm text-yellow-300 mb-2">Send this response code back to your partner:</p>
+        <div class="flex items-center gap-2">
+          <code class="flex-1 bg-gray-800 border border-gray-700 rounded px-3 py-2 text-xs font-mono truncate">{{ joinResponseCode }}</code>
+          <button @click="copyToClipboard(joinResponseCode)"
+            class="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-sm font-medium transition-colors cursor-pointer shrink-0">
+            Copy
+          </button>
+          <button @click="joinResponseCode = ''"
+            class="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded text-sm text-gray-400 transition-colors cursor-pointer shrink-0">
+            Dismiss
+          </button>
+        </div>
+      </div>
+
+      <!-- Split Layout -->
+      <div class="flex-1 flex flex-col lg:flex-row min-h-0">
 
       <!-- ─── LEFT: Chat Panel ─── -->
       <div class="w-full lg:w-1/2 flex flex-col min-h-0 h-[60vh] lg:h-auto">
@@ -831,5 +1074,7 @@ onBeforeUnmount(() => {
       </div>
 
     </div>
+
+    </template>
   </div>
 </template>

@@ -181,8 +181,10 @@ export function useSupabase(options: {
       try {
         const rec = row as Record<string, any>
         const raw = rec[column]
-        const envelope: DbMessageEnvelope = typeof raw === 'string' ? JSON.parse(raw) : raw
-        if (envelope.s !== options.fingerprint.value) {
+        const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw
+
+        const envelope = parsed as DbMessageEnvelope
+        if (envelope.s && envelope.s !== options.fingerprint.value) {
           incoming.push({ pk: rec[idColumn], data: raw })
         }
       } catch {
@@ -254,9 +256,9 @@ export function useSupabase(options: {
             const raw = row[column]
             if (!raw) return
 
-            const envelope: DbMessageEnvelope = typeof raw === 'string' ? JSON.parse(raw) : raw
+            const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw
 
-            if (envelope.s === options.fingerprint.value) return
+            if (parsed.s === options.fingerprint.value) return
 
             console.log('[Supabase] Realtime: new message received')
             const incoming: DbMessageRow = { pk: row[idColumn], data: raw }
