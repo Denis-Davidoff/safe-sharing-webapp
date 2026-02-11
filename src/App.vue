@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, reactive, computed, onBeforeUnmount } from 'vue'
+import { ref, reactive, computed, watch, nextTick, onBeforeUnmount } from 'vue'
 import {
   generateKeyPair,
   computeSharedSecret,
@@ -87,6 +87,24 @@ function createBlobUrl(blob: Blob): string {
   const url = URL.createObjectURL(blob)
   blobUrls.push(url)
   return url
+}
+
+// Message list auto-scroll
+const messageListRef = ref<HTMLElement | null>(null)
+watch(() => messages.length, () => {
+  nextTick(() => {
+    if (messageListRef.value) {
+      messageListRef.value.scrollTop = messageListRef.value.scrollHeight
+    }
+  })
+})
+
+// Enter to send (Shift+Enter for newline)
+function onInputKeydown(e: KeyboardEvent) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault()
+    encrypt()
+  }
 }
 
 const statusText = computed(() => {
@@ -541,7 +559,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="min-h-screen bg-gray-950 text-gray-100 flex flex-col items-center p-4 sm:p-6">
+  <div class="h-screen bg-gray-950 text-gray-100 flex flex-col overflow-hidden">
 
     <!-- Supabase Settings Panel -->
     <DbSettings
@@ -563,28 +581,27 @@ onBeforeUnmount(() => {
       @fetch-columns="db.fetchColumns"
     />
 
-    <div class="w-full max-w-2xl space-y-6">
-
-      <!-- Header -->
-      <div class="text-center space-y-2">
-        <h1 class="text-3xl font-bold tracking-tight">XChat</h1>
-        <p class="text-sm text-gray-400">
-          E2E encrypted · Curve25519 · Double Ratchet
-          <span v-if="db.isListening.value" class="text-emerald-400"> · Realtime sync</span>
-          <span v-else-if="db.isSyncing.value" class="text-yellow-400"> · Polling sync</span>
-        </p>
-        <div class="inline-block px-3 py-1 rounded-full text-xs font-medium"
-          :class="{
-            'bg-gray-800 text-gray-400': phase === 'idle',
-            'bg-yellow-900/50 text-yellow-400': phase === 'waiting',
-            'bg-green-900/50 text-green-400': phase === 'ready',
-          }">
-          {{ statusText }}
-        </div>
+    <!-- Header bar -->
+    <div class="flex items-center justify-between px-4 py-2 border-b border-gray-800 shrink-0">
+      <div class="flex items-center gap-3">
+        <h1 class="text-lg font-bold tracking-tight">XChat</h1>
+        <span class="text-xs text-gray-500">E2E · Curve25519 · Double Ratchet</span>
+        <span v-if="db.isListening.value" class="text-xs text-emerald-400">· Realtime</span>
+        <span v-else-if="db.isSyncing.value" class="text-xs text-yellow-400">· Polling</span>
       </div>
+      <div class="px-2.5 py-0.5 rounded-full text-xs font-medium"
+        :class="{
+          'bg-gray-800 text-gray-400': phase === 'idle',
+          'bg-yellow-900/50 text-yellow-400': phase === 'waiting',
+          'bg-green-900/50 text-green-400': phase === 'ready',
+        }">
+        {{ statusText }}
+      </div>
+    </div>
 
-      <!-- ═══ Handshake Panel ═══ -->
-      <div v-if="phase !== 'ready'" class="space-y-4 bg-gray-900 rounded-xl p-5 border border-gray-800">
+    <!-- ═══ Handshake Panel (centered, before ready) ═══ -->
+    <div v-if="phase !== 'ready'" class="flex-1 flex items-center justify-center p-4">
+      <div class="w-full max-w-lg space-y-4 bg-gray-900 rounded-xl p-5 border border-gray-800">
         <h2 class="text-lg font-semibold">Key Exchange (ECDH · Curve25519)</h2>
 
         <div v-if="phase === 'idle'">
@@ -633,207 +650,186 @@ onBeforeUnmount(() => {
           </button>
         </div>
       </div>
+    </div>
 
-      <!-- ═══ Chat Panel ═══ -->
-      <div v-if="phase === 'ready'" class="space-y-5">
+    <!-- ═══ Split Layout (when ready) ═══ -->
+    <div v-else class="flex-1 flex flex-col lg:flex-row min-h-0">
 
-        <!-- ─── Send section ─── -->
-        <div class="bg-gray-900 rounded-xl p-5 border border-gray-800 space-y-4">
-          <h2 class="text-lg font-semibold text-blue-400">Send</h2>
+      <!-- ─── LEFT: Chat Panel ─── -->
+      <div class="w-full lg:w-1/2 flex flex-col min-h-0 h-[60vh] lg:h-auto">
 
-          <!-- Plaintext textarea (Ctrl+V image detection) -->
-          <div class="space-y-1.5">
-            <label class="block text-sm text-gray-400">Message text</label>
-            <textarea
-              v-model="plaintextInput"
-              @paste="onPaste"
-              placeholder="Type your message... (Ctrl+V to attach image)"
-              class="w-full bg-gray-800 border border-gray-700 rounded-lg p-3 text-sm resize-none h-24 focus:outline-none focus:border-blue-500"
-            />
+        <!-- Message list -->
+        <div ref="messageListRef" class="flex-1 overflow-y-auto min-h-0 p-4 space-y-2">
+          <!-- Empty state -->
+          <div v-if="messages.length === 0" class="h-full flex items-center justify-center">
+            <span class="text-sm text-gray-600">No messages yet</span>
           </div>
 
-          <!-- Attachment buttons + drop zone -->
-          <div class="flex gap-2 items-center">
-            <button @click="toggleRecording"
-              class="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors shrink-0 cursor-pointer"
-              :class="isRecording
-                ? 'bg-red-600 hover:bg-red-500 text-white'
-                : 'bg-gray-700 hover:bg-gray-600'">
-              <span v-if="isRecording" class="w-2 h-2 rounded-full bg-white animate-pulse" />
-              <span v-else>&#x1F3A4;</span>
-              {{ isRecording ? `Stop ${formatTime(recordingSeconds)}` : 'Record' }}
-            </button>
-
-            <label class="flex items-center gap-2 px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm font-medium transition-colors cursor-pointer shrink-0">
-              &#x1F5BC; Image
-              <input type="file" accept="image/*" multiple class="hidden" @change="onFileInput" />
-            </label>
-
-            <span v-if="!isRecording" class="text-xs text-gray-600">max 60s</span>
-          </div>
-
-          <!-- Drop zone -->
-          <div
-            @dragover.prevent="isDragging = true"
-            @dragleave="isDragging = false"
-            @drop="onDrop"
-            class="border-2 border-dashed rounded-lg p-3 text-center text-sm transition-colors"
-            :class="isDragging ? 'border-blue-500 bg-blue-500/10 text-blue-300' : 'border-gray-700 text-gray-500'">
-            Drop images here
-          </div>
-
-          <!-- Attachments preview list -->
-          <div v-if="attachments.length" class="space-y-2">
-            <div class="text-xs text-gray-400 font-medium">Attachments ({{ attachments.length }})</div>
-            <div v-for="att in attachments" :key="att.id"
-              class="relative bg-gray-800 rounded-lg p-3 border border-gray-700">
-              <button @click="removeAttachment(att.id)"
-                class="absolute top-2 right-2 w-6 h-6 flex items-center justify-center rounded-full bg-gray-700 hover:bg-red-600 text-xs transition-colors cursor-pointer z-10">
-                &#x2715;
-              </button>
-
-              <!-- Audio -->
-              <div v-if="att.type === 'audio'" class="flex items-center gap-3 pr-8">
-                <span class="text-xl">&#x1F3A4;</span>
-                <div class="flex-1 space-y-1 min-w-0">
-                  <div class="text-sm font-medium">Voice message</div>
-                  <div class="text-xs text-gray-400">{{ formatSize(att.data.length) }}</div>
-                  <audio :src="att.previewUrl" controls class="w-full h-8" />
-                </div>
-              </div>
-
-              <!-- Image -->
-              <div v-if="att.type === 'image'" class="space-y-2 pr-8">
-                <div class="flex items-center gap-2">
-                  <span>&#x1F5BC;</span>
-                  <span class="text-sm font-medium">Image</span>
-                  <span class="text-xs text-gray-400">{{ formatSize(att.data.length) }} · {{ att.mime }}</span>
-                </div>
-                <img :src="att.previewUrl" class="max-h-36 rounded-lg object-contain" />
-              </div>
-            </div>
-          </div>
-
-          <!-- Encrypt button -->
-          <button @click="encrypt"
-            :disabled="!canEncrypt"
-            class="w-full py-2.5 px-4 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg font-medium transition-colors cursor-pointer disabled:cursor-not-allowed">
-            Encrypt &amp; Send →
-          </button>
-
-          <!-- Encrypted output -->
-          <div class="space-y-1.5">
-            <label class="block text-sm text-gray-400">Encrypted output (copy this)</label>
-            <div class="flex gap-2">
-              <textarea readonly
-                :value="encryptedOutput"
-                placeholder="Encrypted output will appear here..."
-                class="flex-1 bg-gray-800 border border-gray-700 rounded-lg p-3 text-sm font-mono resize-none h-24 focus:outline-none"
-              />
-              <button
-                @click="copyToClipboard(encryptedOutput)"
-                :disabled="!encryptedOutput"
-                class="px-4 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:text-gray-600 rounded-lg text-sm font-medium transition-colors shrink-0 self-start cursor-pointer disabled:cursor-not-allowed">
-                Copy
-              </button>
-            </div>
-          </div>
-        </div>
-
-        <!-- ─── Receive section ─── -->
-        <div class="bg-gray-900 rounded-xl p-5 border border-gray-800 space-y-4">
-          <h2 class="text-lg font-semibold text-emerald-400">Receive</h2>
-
-          <div class="space-y-1.5">
-            <label class="block text-sm text-gray-400">Peer's encrypted message</label>
-            <div class="flex gap-2">
-              <textarea
-                v-model="peerEncryptedInput"
-                placeholder="Paste encrypted message from peer..."
-                class="flex-1 bg-gray-800 border border-gray-700 rounded-lg p-3 text-sm font-mono resize-none h-24 focus:outline-none focus:border-emerald-500"
-              />
-              <button
-                @click="pasteFromClipboard('peerMessage')"
-                class="px-4 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm font-medium transition-colors shrink-0 self-start cursor-pointer">
-                Paste
-              </button>
-            </div>
-          </div>
-
-          <button @click="decrypt"
-            :disabled="!peerEncryptedInput.trim()"
-            class="w-full py-2.5 px-4 bg-emerald-600 hover:bg-emerald-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg font-medium transition-colors cursor-pointer disabled:cursor-not-allowed">
-            ← Decrypt
-          </button>
-
-          <!-- Decrypted result -->
-          <div v-if="decryptedResult" class="space-y-3">
-            <label class="block text-sm text-gray-400">Decrypted</label>
-
-            <!-- Text -->
-            <div v-if="decryptedResult.text"
-              class="bg-gray-800 border border-gray-700 rounded-lg p-3 text-sm whitespace-pre-wrap">
-              {{ decryptedResult.text }}
-            </div>
-
-            <!-- Attachments -->
-            <div v-for="(att, i) in decryptedResult.attachments" :key="i"
-              class="bg-gray-800 border border-gray-700 rounded-lg p-3">
-              <!-- Audio -->
-              <div v-if="att.type === 'audio'" class="space-y-2">
-                <div class="flex items-center gap-2 text-sm">
-                  <span>&#x1F3A4;</span>
-                  <span class="font-medium">Voice message</span>
-                </div>
-                <audio :src="att.blobUrl" controls class="w-full" />
-              </div>
-              <!-- Image -->
-              <div v-else class="space-y-2">
-                <div class="flex items-center gap-2 text-sm">
-                  <span>&#x1F5BC;</span>
-                  <span class="font-medium">Image</span>
-                </div>
-                <img :src="att.blobUrl" class="max-h-80 rounded-lg object-contain" />
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- ─── Message History ─── -->
-        <div v-if="messages.length" class="bg-gray-900 rounded-xl p-5 border border-gray-800 space-y-3">
-          <h2 class="text-lg font-semibold text-gray-300">History</h2>
-          <div class="space-y-2 max-h-96 overflow-y-auto">
-            <div v-for="(msg, i) in messages" :key="i"
-              class="text-sm px-3 py-2.5 rounded-lg space-y-2"
+          <!-- Message bubbles -->
+          <div v-for="(msg, i) in messages" :key="i"
+            class="flex" :class="msg.direction === 'sent' ? 'justify-end' : 'justify-start'">
+            <div class="max-w-[75%] px-3.5 py-2.5 space-y-2"
               :class="msg.direction === 'sent'
-                ? 'bg-blue-900/30 border border-blue-800/50'
-                : 'bg-emerald-900/30 border border-emerald-800/50'">
+                ? 'bg-blue-600 rounded-2xl rounded-br-md'
+                : 'bg-gray-800 rounded-2xl rounded-bl-md'">
 
-              <span class="text-xs font-medium uppercase tracking-wider"
-                :class="msg.direction === 'sent' ? 'text-blue-500' : 'text-emerald-500'">
-                {{ msg.direction === 'sent' ? 'You' : 'Peer' }}
-              </span>
-
-              <div v-if="msg.text" class="text-gray-200">{{ msg.text }}</div>
+              <div v-if="msg.text" class="text-sm whitespace-pre-wrap">{{ msg.text }}</div>
 
               <template v-if="msg.attachments">
                 <div v-for="(att, j) in msg.attachments" :key="j">
                   <audio v-if="att.type === 'audio'" :src="att.blobUrl" controls class="w-full h-8" />
-                  <img v-else :src="att.blobUrl" class="max-h-32 rounded object-contain" />
+                  <img v-else :src="att.blobUrl" class="max-h-48 rounded-lg object-contain" />
                 </div>
               </template>
             </div>
           </div>
         </div>
 
-        <!-- Stats & Reset -->
-        <div class="flex items-center justify-between text-xs text-gray-500">
-          <span>Sent: {{ sendMessageCount }} · Received: {{ recvMessageCount }}</span>
-          <button @click="resetAll" class="text-red-400 hover:text-red-300 transition-colors cursor-pointer">
-            Reset Session
+        <!-- Attachment preview strip -->
+        <div v-if="attachments.length" class="flex gap-2 px-4 py-2 border-t border-gray-800 overflow-x-auto shrink-0">
+          <div v-for="att in attachments" :key="att.id"
+            class="relative flex items-center gap-2 bg-gray-800 rounded-lg px-2.5 py-1.5 shrink-0 border border-gray-700">
+            <button @click="removeAttachment(att.id)"
+              class="absolute -top-1.5 -right-1.5 w-5 h-5 flex items-center justify-center rounded-full bg-gray-700 hover:bg-red-600 text-xs transition-colors cursor-pointer z-10">
+              &#x2715;
+            </button>
+            <!-- Audio chip -->
+            <template v-if="att.type === 'audio'">
+              <span class="text-sm">&#x1F3A4;</span>
+              <span class="text-xs text-gray-300">Voice · {{ formatSize(att.data.length) }}</span>
+            </template>
+            <!-- Image chip -->
+            <template v-else>
+              <img :src="att.previewUrl" class="h-12 rounded object-contain" />
+              <span class="text-xs text-gray-400">{{ formatSize(att.data.length) }}</span>
+            </template>
+          </div>
+        </div>
+
+        <!-- Input bar -->
+        <div class="flex items-end gap-2 p-3 border-t border-gray-800 bg-gray-900 shrink-0"
+          @dragover.prevent="isDragging = true"
+          @dragleave="isDragging = false"
+          @drop="onDrop"
+          :class="isDragging ? 'ring-2 ring-blue-500 ring-inset' : ''">
+
+          <!-- Attach file -->
+          <label class="flex items-center justify-center w-10 h-10 rounded-full hover:bg-gray-800 transition-colors cursor-pointer shrink-0">
+            <span class="text-lg text-gray-400">&#x1F4CE;</span>
+            <input type="file" accept="image/*" multiple class="hidden" @change="onFileInput" />
+          </label>
+
+          <!-- Text input -->
+          <textarea
+            v-model="plaintextInput"
+            @paste="onPaste"
+            @keydown="onInputKeydown"
+            placeholder="Message..."
+            rows="1"
+            class="flex-1 bg-gray-800 border border-gray-700 rounded-2xl px-4 py-2.5 text-sm resize-none max-h-32 focus:outline-none focus:border-blue-500 overflow-y-auto"
+          />
+
+          <!-- Record audio -->
+          <button @click="toggleRecording"
+            class="flex items-center justify-center w-10 h-10 rounded-full transition-colors cursor-pointer shrink-0"
+            :class="isRecording ? 'bg-red-600 hover:bg-red-500' : 'hover:bg-gray-800'">
+            <span v-if="isRecording" class="text-xs font-medium text-white">{{ formatTime(recordingSeconds) }}</span>
+            <span v-else class="text-lg text-gray-400">&#x1F3A4;</span>
+          </button>
+
+          <!-- Send button -->
+          <button @click="encrypt"
+            :disabled="!canEncrypt"
+            class="flex items-center justify-center w-10 h-10 rounded-full bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 transition-colors cursor-pointer disabled:cursor-not-allowed shrink-0">
+            <span class="text-sm">&#x27A4;</span>
           </button>
         </div>
       </div>
+
+      <!-- ─── RIGHT: Crypto Panels ─── -->
+      <div class="w-full lg:w-1/2 flex flex-col min-h-0 border-t lg:border-t-0 lg:border-l border-gray-800 h-[40vh] lg:h-auto">
+        <div class="flex-1 overflow-y-auto p-4 space-y-4">
+
+          <!-- Encrypted output -->
+          <div class="bg-gray-900 rounded-xl p-4 border border-gray-800 space-y-3">
+            <h2 class="text-sm font-semibold text-blue-400">Encrypted output</h2>
+            <div class="flex gap-2">
+              <textarea readonly
+                :value="encryptedOutput"
+                placeholder="Encrypted output will appear here..."
+                class="flex-1 bg-gray-800 border border-gray-700 rounded-lg p-3 text-xs font-mono resize-none h-24 focus:outline-none"
+              />
+              <button
+                @click="copyToClipboard(encryptedOutput)"
+                :disabled="!encryptedOutput"
+                class="px-3 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:text-gray-600 rounded-lg text-sm font-medium transition-colors shrink-0 self-start cursor-pointer disabled:cursor-not-allowed">
+                Copy
+              </button>
+            </div>
+          </div>
+
+          <!-- Receive / Decrypt -->
+          <div class="bg-gray-900 rounded-xl p-4 border border-gray-800 space-y-3">
+            <h2 class="text-sm font-semibold text-emerald-400">Receive &amp; Decrypt</h2>
+
+            <div class="flex gap-2">
+              <textarea
+                v-model="peerEncryptedInput"
+                placeholder="Paste encrypted message from peer..."
+                class="flex-1 bg-gray-800 border border-gray-700 rounded-lg p-3 text-xs font-mono resize-none h-24 focus:outline-none focus:border-emerald-500"
+              />
+              <button
+                @click="pasteFromClipboard('peerMessage')"
+                class="px-3 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm font-medium transition-colors shrink-0 self-start cursor-pointer">
+                Paste
+              </button>
+            </div>
+
+            <button @click="decrypt"
+              :disabled="!peerEncryptedInput.trim()"
+              class="w-full py-2 px-4 bg-emerald-600 hover:bg-emerald-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg text-sm font-medium transition-colors cursor-pointer disabled:cursor-not-allowed">
+              Decrypt
+            </button>
+
+            <!-- Decrypted result -->
+            <div v-if="decryptedResult" class="space-y-2">
+              <label class="block text-xs text-gray-400">Decrypted</label>
+
+              <div v-if="decryptedResult.text"
+                class="bg-gray-800 border border-gray-700 rounded-lg p-3 text-sm whitespace-pre-wrap">
+                {{ decryptedResult.text }}
+              </div>
+
+              <div v-for="(att, i) in decryptedResult.attachments" :key="i"
+                class="bg-gray-800 border border-gray-700 rounded-lg p-3">
+                <div v-if="att.type === 'audio'" class="space-y-2">
+                  <div class="flex items-center gap-2 text-sm">
+                    <span>&#x1F3A4;</span>
+                    <span class="font-medium">Voice message</span>
+                  </div>
+                  <audio :src="att.blobUrl" controls class="w-full" />
+                </div>
+                <div v-else class="space-y-2">
+                  <div class="flex items-center gap-2 text-sm">
+                    <span>&#x1F5BC;</span>
+                    <span class="font-medium">Image</span>
+                  </div>
+                  <img :src="att.blobUrl" class="max-h-80 rounded-lg object-contain" />
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Stats & Reset -->
+          <div class="flex items-center justify-between text-xs text-gray-500 pt-2">
+            <span>Sent: {{ sendMessageCount }} · Received: {{ recvMessageCount }}</span>
+            <button @click="resetAll" class="text-red-400 hover:text-red-300 transition-colors cursor-pointer">
+              Reset Session
+            </button>
+          </div>
+        </div>
+      </div>
+
     </div>
   </div>
 </template>

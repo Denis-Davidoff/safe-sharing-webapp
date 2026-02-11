@@ -179,10 +179,11 @@ export function useSupabase(options: {
     const incoming: DbMessageRow[] = []
     for (const row of data) {
       try {
-        const raw = row[column]
+        const rec = row as Record<string, any>
+        const raw = rec[column]
         const envelope: DbMessageEnvelope = typeof raw === 'string' ? JSON.parse(raw) : raw
         if (envelope.s !== options.fingerprint.value) {
-          incoming.push({ pk: row[idColumn], data: raw })
+          incoming.push({ pk: rec[idColumn], data: raw })
         }
       } catch {
         // skip malformed rows
