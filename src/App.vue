@@ -731,13 +731,19 @@ onBeforeUnmount(() => {
         <span v-if="db.isListening.value" class="text-xs text-emerald-400">· Realtime</span>
         <span v-else-if="db.isSyncing.value" class="text-xs text-yellow-400">· Polling</span>
       </div>
-      <div class="px-2.5 py-0.5 rounded-full text-xs font-medium"
-        :class="{
-          'bg-gray-800 text-gray-400': phase === 'idle',
-          'bg-yellow-900/50 text-yellow-400': phase === 'waiting',
-          'bg-green-900/50 text-green-400': phase === 'ready',
-        }">
-        {{ statusText }}
+      <div class="flex items-center gap-2">
+        <div class="px-2.5 py-0.5 rounded-full text-xs font-medium"
+          :class="{
+            'bg-gray-800 text-gray-400': phase === 'idle',
+            'bg-yellow-900/50 text-yellow-400': phase === 'waiting',
+            'bg-green-900/50 text-green-400': phase === 'ready',
+          }">
+          {{ statusText }}
+        </div>
+        <button v-if="phase === 'ready'" @click="resetAll"
+          class="text-xs text-red-400 hover:text-red-300 transition-colors cursor-pointer">
+          Reset
+        </button>
       </div>
     </div>
 
@@ -985,10 +991,10 @@ onBeforeUnmount(() => {
       </div>
 
       <!-- Split Layout -->
-      <div class="flex-1 flex flex-col lg:flex-row min-h-0">
+      <div class="flex-1 flex flex-col lg:flex-row min-h-0" :class="connectionMode === 'supabase' ? 'justify-center' : ''">
 
       <!-- ─── LEFT: Chat Panel ─── -->
-      <div class="w-full lg:w-1/2 flex flex-col min-h-0 h-[60vh] lg:h-auto">
+      <div class="flex flex-col min-h-0" :class="connectionMode === 'supabase' ? 'w-full max-w-2xl mx-auto h-full' : 'w-full lg:w-1/2 h-[60vh] lg:h-auto'">
 
         <!-- Message list -->
         <div ref="messageListRef" class="flex-1 overflow-y-auto min-h-0 p-4 space-y-2">
@@ -1119,8 +1125,8 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-      <!-- ─── RIGHT: Crypto Panels ─── -->
-      <div class="w-full lg:w-1/2 flex flex-col min-h-0 border-t lg:border-t-0 lg:border-l border-gray-800 h-[40vh] lg:h-auto">
+      <!-- ─── RIGHT: Crypto Panels (hidden in Supabase mode) ─── -->
+      <div v-if="connectionMode !== 'supabase'" class="w-full lg:w-1/2 flex flex-col min-h-0 border-t lg:border-t-0 lg:border-l border-gray-800 h-[40vh] lg:h-auto">
         <div class="flex-1 overflow-y-auto p-4 space-y-4">
 
           <!-- Encrypted output -->
