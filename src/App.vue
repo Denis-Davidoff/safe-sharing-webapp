@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, reactive, computed, watch, nextTick, onBeforeUnmount } from 'vue'
+import { useLocalStorage } from '@vueuse/core'
 import {
   generateKeyPair,
   computeSharedSecret,
@@ -48,6 +49,7 @@ const peerEncryptedInput = ref('')
 const joinMode = ref(false)
 const joinResponseCode = ref('')
 const connectionMode = ref<'manual' | 'supabase'>('manual')
+const soundEnabled = useLocalStorage('xchat-sound-enabled', true)
 
 // Attachments (multiple)
 interface UIAttachment {
@@ -201,6 +203,43 @@ const canEncrypt = computed(() => {
   return attachments.length > 0 || plaintextInput.value.trim().length > 0
 })
 
+// ─── Notification Sound ──────────────────────────────────────────
+
+let audioCtx: AudioContext | null = null
+
+function playNotificationSound() {
+  if (!soundEnabled.value) return
+  try {
+    if (!audioCtx) audioCtx = new AudioContext()
+    const ctx = audioCtx
+
+    const osc1 = ctx.createOscillator()
+    const osc2 = ctx.createOscillator()
+    const gain = ctx.createGain()
+
+    osc1.type = 'sine'
+    osc1.frequency.setValueAtTime(880, ctx.currentTime)
+    osc1.frequency.setValueAtTime(1047, ctx.currentTime + 0.08)
+
+    osc2.type = 'sine'
+    osc2.frequency.setValueAtTime(1320, ctx.currentTime + 0.08)
+
+    gain.gain.setValueAtTime(0.15, ctx.currentTime)
+    gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.25)
+
+    osc1.connect(gain)
+    osc2.connect(gain)
+    gain.connect(ctx.destination)
+
+    osc1.start(ctx.currentTime)
+    osc2.start(ctx.currentTime + 0.08)
+    osc1.stop(ctx.currentTime + 0.25)
+    osc2.stop(ctx.currentTime + 0.25)
+  } catch {
+    // Audio not available
+  }
+}
+
 // ─── Supabase ────────────────────────────────────────────────────
 
 const fingerprint = computed(() => {
@@ -260,6 +299,7 @@ function handleDbMessages(rows: DbMessageRow[]) {
       })
 
       console.log(`[DB-Recv #${msgNum}] Decrypted and added to history`)
+      playNotificationSound()
 
       // 5. Delete from DB
       db.deleteMessage(row.pk)
@@ -628,6 +668,7 @@ function decrypt() {
     attachments: resultAttachments,
   })
 
+  playNotificationSound()
   console.log(`[Recv #${msgNum}] Done`)
 }
 
@@ -740,6 +781,12 @@ onBeforeUnmount(() => {
           }">
           {{ statusText }}
         </div>
+        <button v-if="phase === 'ready'" @click="soundEnabled = !soundEnabled"
+          class="w-7 h-7 flex items-center justify-center rounded-full hover:bg-gray-800 transition-colors cursor-pointer"
+          :title="soundEnabled ? 'Mute notifications' : 'Unmute notifications'">
+          <span v-if="soundEnabled" class="text-sm">&#x1F514;</span>
+          <span v-else class="text-sm opacity-40">&#x1F515;</span>
+        </button>
         <button v-if="phase === 'ready'" @click="resetAll"
           class="text-xs text-red-400 hover:text-red-300 transition-colors cursor-pointer">
           Reset

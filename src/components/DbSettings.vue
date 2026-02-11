@@ -46,7 +46,7 @@ const stateColor: Record<DbConnectionState, string> = {
 <template>
   <!-- Gear button -->
   <button @click="isOpen = !isOpen"
-    class="fixed top-4 right-4 z-50 w-10 h-10 flex items-center justify-center rounded-full bg-gray-800 border border-gray-700 hover:bg-gray-700 transition-colors cursor-pointer">
+    class="fixed top-[61px] right-4 z-50 w-10 h-10 flex items-center justify-center rounded-full bg-gray-800 border border-gray-700 hover:bg-gray-700 transition-colors cursor-pointer">
     <span class="text-lg">&#x2699;</span>
     <span v-if="isConnected" class="absolute -top-0.5 -right-0.5 w-3 h-3 rounded-full bg-green-500 border-2 border-gray-950" />
   </button>
