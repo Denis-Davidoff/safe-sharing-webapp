@@ -78,11 +78,90 @@ const decryptedResult = ref<{
 
 // Message history
 interface ChatMessage {
+  id: number
   direction: 'sent' | 'received'
   text?: string
   attachments?: Array<{ type: 'audio' | 'image'; blobUrl: string }>
 }
+let messageIdCounter = 0
 const messages = reactive<ChatMessage[]>([])
+
+// Audio player state
+const audioStates = reactive<Record<string, { playing: boolean; currentTime: number; duration: number }>>({})
+const audioRefs: Record<string, HTMLAudioElement> = {}
+
+function initAudioState(key: string, el: HTMLAudioElement) {
+  audioRefs[key] = el
+  if (!audioStates[key]) {
+    audioStates[key] = { playing: false, currentTime: 0, duration: isFinite(el.duration) ? el.duration : 0 }
+  }
+}
+
+function onAudioMetadata(key: string, el: HTMLAudioElement) {
+  if (audioStates[key] && isFinite(el.duration)) {
+    audioStates[key].duration = el.duration
+  }
+}
+
+function toggleAudio(key: string) {
+  const el = audioRefs[key]
+  if (!el) return
+  const state = audioStates[key]
+  if (!state) return
+  if (state.playing) {
+    el.pause()
+    state.playing = false
+  } else {
+    // Pause any other playing audio
+    for (const [k, s] of Object.entries(audioStates)) {
+      if (s.playing && k !== key) {
+        audioRefs[k]?.pause()
+        s.playing = false
+      }
+    }
+    el.play()
+    state.playing = true
+  }
+}
+
+function onAudioTimeUpdate(key: string, el: HTMLAudioElement) {
+  if (audioStates[key]) audioStates[key].currentTime = el.currentTime
+}
+
+function onAudioEnded(key: string) {
+  if (audioStates[key]) {
+    audioStates[key].playing = false
+    audioStates[key].currentTime = 0
+  }
+}
+
+function audioProgress(key: string): number {
+  const s = audioStates[key]
+  if (!s || !s.duration) return 0
+  return (s.currentTime / s.duration) * 100
+}
+
+function deleteMessage(idx: number) {
+  const msg = messages[idx]
+  if (!msg) return
+  if (msg.attachments) {
+    for (const att of msg.attachments) {
+      URL.revokeObjectURL(att.blobUrl)
+    }
+  }
+  // Clean up audio states for this message
+  if (msg.attachments) {
+    msg.attachments.forEach((_, j) => {
+      const key = `${msg.id}-${j}`
+      if (audioRefs[key]) {
+        audioRefs[key].pause()
+        delete audioRefs[key]
+      }
+      delete audioStates[key]
+    })
+  }
+  messages.splice(idx, 1)
+}
 
 // Blob URL tracking
 const blobUrls: string[] = []
@@ -174,6 +253,7 @@ function handleDbMessages(rows: DbMessageRow[]) {
       })
 
       messages.push({
+        id: ++messageIdCounter,
         direction: 'received',
         text: payload.text,
         attachments: resultAttachments,
@@ -480,6 +560,7 @@ function encrypt() {
     blobUrl: a.previewUrl,
   }))
   messages.push({
+    id: ++messageIdCounter,
     direction: 'sent',
     text: plaintextInput.value.trim() || undefined,
     attachments: historyAttachments.length > 0 ? historyAttachments : undefined,
@@ -541,6 +622,7 @@ function decrypt() {
   }
 
   messages.push({
+    id: ++messageIdCounter,
     direction: 'received',
     text: payload.text,
     attachments: resultAttachments,
@@ -566,8 +648,9 @@ async function pasteFromClipboard(target: 'peerKey' | 'peerMessage') {
 // ─── Helpers ─────────────────────────────────────────────────────
 
 function formatTime(seconds: number): string {
-  const m = Math.floor(seconds / 60)
-  const s = seconds % 60
+  const total = Math.floor(seconds)
+  const m = Math.floor(total / 60)
+  const s = total % 60
   return `${m}:${s.toString().padStart(2, '0')}`
 }
 
@@ -596,6 +679,12 @@ function resetAll() {
   joinResponseCode.value = ''
   connectionMode.value = 'manual'
   attachments.length = 0
+  // Clean up audio players
+  for (const [k, el] of Object.entries(audioRefs)) {
+    el.pause()
+    delete audioRefs[k]
+  }
+  for (const k of Object.keys(audioStates)) delete audioStates[k]
   messages.length = 0
   stopRecording()
   db.stopSync()
@@ -909,18 +998,59 @@ onBeforeUnmount(() => {
           </div>
 
           <!-- Message bubbles -->
-          <div v-for="(msg, i) in messages" :key="i"
-            class="flex" :class="msg.direction === 'sent' ? 'justify-end' : 'justify-start'">
-            <div class="max-w-[75%] px-3.5 py-2.5 space-y-2"
+          <div v-for="(msg, i) in messages" :key="msg.id"
+            class="flex group" :class="msg.direction === 'sent' ? 'justify-end' : 'justify-start'">
+            <div class="relative max-w-[75%] px-3.5 py-2.5 space-y-2"
               :class="msg.direction === 'sent'
                 ? 'bg-blue-600 rounded-2xl rounded-br-md'
                 : 'bg-gray-800 rounded-2xl rounded-bl-md'">
+
+              <!-- Delete button (hover) -->
+              <button @click="deleteMessage(i)"
+                class="absolute -top-2 opacity-0 group-hover:opacity-100 w-5 h-5 flex items-center justify-center rounded-full bg-gray-900 border border-gray-700 hover:bg-red-600 hover:border-red-600 text-[10px] transition-all cursor-pointer z-10"
+                :class="msg.direction === 'sent' ? '-left-2' : '-right-2'">
+                &#x2715;
+              </button>
 
               <div v-if="msg.text" class="text-sm whitespace-pre-wrap">{{ msg.text }}</div>
 
               <template v-if="msg.attachments">
                 <div v-for="(att, j) in msg.attachments" :key="j">
-                  <audio v-if="att.type === 'audio'" :src="att.blobUrl" controls class="w-full h-8" />
+
+                  <!-- Audio player -->
+                  <div v-if="att.type === 'audio'" class="flex items-center gap-2.5 min-w-[200px]">
+                    <audio :src="att.blobUrl"
+                      :ref="(el: any) => { if (el) initAudioState(`${msg.id}-${j}`, el) }"
+                      @loadedmetadata="onAudioMetadata(`${msg.id}-${j}`, $event.target as HTMLAudioElement)"
+                      @timeupdate="onAudioTimeUpdate(`${msg.id}-${j}`, $event.target as HTMLAudioElement)"
+                      @ended="onAudioEnded(`${msg.id}-${j}`)"
+                      preload="metadata"
+                      class="hidden" />
+
+                    <!-- Play/Pause -->
+                    <button @click="toggleAudio(`${msg.id}-${j}`)"
+                      class="w-8 h-8 flex items-center justify-center rounded-full shrink-0 cursor-pointer transition-colors"
+                      :class="msg.direction === 'sent' ? 'bg-blue-500 hover:bg-blue-400' : 'bg-gray-700 hover:bg-gray-600'">
+                      <span v-if="audioStates[`${msg.id}-${j}`]?.playing" class="text-sm leading-none">&#x23F8;</span>
+                      <span v-else class="text-[10px] leading-none ml-0.5">&#x25B6;</span>
+                    </button>
+
+                    <!-- Progress + Duration -->
+                    <div class="flex-1 min-w-0 space-y-1">
+                      <div class="h-1 rounded-full overflow-hidden"
+                        :class="msg.direction === 'sent' ? 'bg-blue-500/40' : 'bg-gray-600'">
+                        <div class="h-full rounded-full transition-[width] duration-200"
+                          :class="msg.direction === 'sent' ? 'bg-white/70' : 'bg-gray-400'"
+                          :style="{ width: audioProgress(`${msg.id}-${j}`) + '%' }" />
+                      </div>
+                      <span class="text-[10px] opacity-60">
+                        {{ formatTime(audioStates[`${msg.id}-${j}`]?.currentTime ?? 0) }}
+                        / {{ formatTime(audioStates[`${msg.id}-${j}`]?.duration ?? 0) }}
+                      </span>
+                    </div>
+                  </div>
+
+                  <!-- Image -->
                   <img v-else :src="att.blobUrl" class="max-h-48 rounded-lg object-contain" />
                 </div>
               </template>
