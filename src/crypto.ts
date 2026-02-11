@@ -4,9 +4,10 @@ import { encodeBase64, decodeBase64 } from 'tweetnacl-util'
 // ─── Types ───────────────────────────────────────────────────────
 
 export interface Attachment {
-  type: 'audio' | 'image'
+  type: 'audio' | 'image' | 'file'
   mime: string
   data: string // base64-encoded binary
+  name?: string // filename for file attachments
 }
 
 export interface MessagePayload {

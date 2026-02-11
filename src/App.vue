@@ -52,11 +52,14 @@ const connectionMode = ref<'manual' | 'supabase'>('manual')
 const soundEnabled = useLocalStorage('xchat-sound-enabled', true)
 
 // Attachments (multiple)
+const MAX_FILE_SIZE = 5 * 1024 * 1024 // 5 MB
+
 interface UIAttachment {
   id: number
-  type: 'audio' | 'image'
+  type: 'audio' | 'image' | 'file'
   data: Uint8Array
   mime: string
+  name: string
   previewUrl: string
 }
 let attachmentIdCounter = 0
@@ -75,7 +78,7 @@ const isDragging = ref(false)
 // Decrypted result
 const decryptedResult = ref<{
   text?: string
-  attachments?: Array<{ type: 'audio' | 'image'; blobUrl: string }>
+  attachments?: Array<{ type: 'audio' | 'image' | 'file'; blobUrl: string; name?: string; size?: number }>
 } | null>(null)
 
 // Message history
@@ -83,8 +86,11 @@ interface ChatMessage {
   id: number
   direction: 'sent' | 'received'
   text?: string
-  attachments?: Array<{ type: 'audio' | 'image'; blobUrl: string }>
+  attachments?: Array<{ type: 'audio' | 'image' | 'file'; blobUrl: string; name?: string; size?: number }>
 }
+
+// Image zoom
+const zoomImageUrl = ref<string | null>(null)
 let messageIdCounter = 0
 const messages = reactive<ChatMessage[]>([])
 
@@ -199,8 +205,10 @@ const statusText = computed(() => {
   }
 })
 
+const isSending = ref(false)
+
 const canEncrypt = computed(() => {
-  return attachments.length > 0 || plaintextInput.value.trim().length > 0
+  return !isSending.value && (attachments.length > 0 || plaintextInput.value.trim().length > 0)
 })
 
 // ─── Notification Sound ──────────────────────────────────────────
@@ -287,8 +295,8 @@ function handleDbMessages(rows: DbMessageRow[]) {
       // 4. Build result and add to history
       const resultAttachments = payload.attachments?.map(a => {
         const bytes = base64ToBytes(a.data)
-        const blob = new Blob([bytes.buffer as ArrayBuffer], { type: a.mime })
-        return { type: a.type, blobUrl: createBlobUrl(blob) }
+        const blob = new Blob([bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer], { type: a.mime })
+        return { type: a.type, blobUrl: createBlobUrl(blob), name: a.name, size: bytes.byteLength }
       })
 
       messages.push({
@@ -451,6 +459,7 @@ async function startRecording() {
         type: 'audio',
         data: new Uint8Array(buffer),
         mime: actualMime,
+        name: 'voice.webm',
         previewUrl: createBlobUrl(blob),
       })
       stream.getTracks().forEach(t => t.stop())
@@ -484,25 +493,29 @@ function stopRecording() {
   }
 }
 
-// ─── Image Handling ──────────────────────────────────────────────
+// ─── File Handling ───────────────────────────────────────────────
 
-function handleImageFile(file: File) {
-  if (!file.type.startsWith('image/')) {
-    console.warn('[Image] Not an image file:', file.type)
+function handleFile(file: File) {
+  if (file.size > MAX_FILE_SIZE) {
+    alert(`File "${file.name}" is too large (${formatSize(file.size)}). Maximum size is ${formatSize(MAX_FILE_SIZE)}.`)
     return
   }
-  console.log(`[Image] Attaching: ${file.name} (${file.type}, ${file.size} bytes)`)
+  const type: 'audio' | 'image' | 'file' = file.type.startsWith('image/') ? 'image'
+    : file.type.startsWith('audio/') ? 'audio' : 'file'
+
+  console.log(`[File] Attaching: ${file.name} (${file.type || 'unknown'}, ${file.size} bytes, type: ${type})`)
 
   const reader = new FileReader()
   reader.onload = () => {
     attachments.push({
       id: ++attachmentIdCounter,
-      type: 'image',
+      type,
       data: new Uint8Array(reader.result as ArrayBuffer),
-      mime: file.type,
+      mime: file.type || 'application/octet-stream',
+      name: file.name,
       previewUrl: createBlobUrl(file),
     })
-    console.log(`[Image] Attached: ${(reader.result as ArrayBuffer).byteLength} bytes`)
+    console.log(`[File] Attached: ${file.name} (${(reader.result as ArrayBuffer).byteLength} bytes)`)
   }
   reader.readAsArrayBuffer(file)
 }
@@ -513,7 +526,7 @@ function onDrop(e: DragEvent) {
   const files = e.dataTransfer?.files
   if (files) {
     for (let i = 0; i < files.length; i++) {
-      handleImageFile(files[i]!)
+      handleFile(files[i]!)
     }
   }
 }
@@ -525,7 +538,7 @@ function onPaste(e: ClipboardEvent) {
     if (item.type.startsWith('image/')) {
       e.preventDefault()
       const file = item.getAsFile()
-      if (file) handleImageFile(file)
+      if (file) handleFile(file)
       return
     }
   }
@@ -536,7 +549,7 @@ function onFileInput(e: Event) {
   const files = input.files
   if (files) {
     for (let i = 0; i < files.length; i++) {
-      handleImageFile(files[i]!)
+      handleFile(files[i]!)
     }
   }
   input.value = ''
@@ -550,13 +563,20 @@ function removeAttachment(id: number) {
 
 // ─── Messaging ───────────────────────────────────────────────────
 
-function encrypt() {
+async function encrypt() {
   if (!sendChain.value || !peerRatchetPublic.value || !canEncrypt.value) return
+
+  isSending.value = true
 
   const msgNum = sendMessageCount.value + 1
   console.log('═══════════════════════════════════════════')
   console.log(`[Send #${msgNum}] Encrypting with Double Ratchet...`)
   console.log('═══════════════════════════════════════════')
+
+  // Save ratchet state for rollback on send failure
+  const prevSendChain = sendChain.value
+  const prevOurRatchetKeyPair = ourRatchetKeyPair.value
+  const prevSendMessageCount = sendMessageCount.value
 
   // 1. Symmetric ratchet → message key
   const { nextChainKey, messageKey } = ratchetStep(sendChain.value)
@@ -570,6 +590,7 @@ function encrypt() {
     type: a.type,
     mime: a.mime,
     data: bytesToBase64(a.data),
+    name: a.type === 'file' || a.type === 'image' ? a.name : undefined,
   }))
 
   const payload: MessagePayload = {
@@ -594,10 +615,27 @@ function encrypt() {
 
   console.log(`[Send #${msgNum}] Send chain updated with DH ratchet (post-compromise security)`)
 
-  // 6. Save to history
+  // 6. Auto-send to Supabase if configured — await and rollback on failure
+  if (db.isConfigured.value) {
+    const ok = await db.sendMessage(encrypted)
+    if (!ok) {
+      console.error(`[Send #${msgNum}] Supabase send failed — rolling back ratchet`)
+      sendChain.value = prevSendChain
+      ourRatchetKeyPair.value = prevOurRatchetKeyPair
+      sendMessageCount.value = prevSendMessageCount
+      encryptedOutput.value = ''
+      isSending.value = false
+      return
+    }
+    console.log(`[Send #${msgNum}] Auto-sent to Supabase`)
+  }
+
+  // 7. Save to history
   const historyAttachments = attachments.map(a => ({
-    type: a.type as 'audio' | 'image',
+    type: a.type,
     blobUrl: a.previewUrl,
+    name: a.name,
+    size: a.data.length,
   }))
   messages.push({
     id: ++messageIdCounter,
@@ -606,22 +644,17 @@ function encrypt() {
     attachments: historyAttachments.length > 0 ? historyAttachments : undefined,
   })
 
-  // 7. Auto-send to Supabase if configured
-  if (db.isConfigured.value) {
-    db.sendMessage(encrypted).then(ok => {
-      if (ok) console.log(`[Send #${msgNum}] Auto-sent to Supabase`)
-    })
-  }
-
   // 8. Clear inputs
   plaintextInput.value = ''
   attachments.length = 0
+  isSending.value = false
   console.log(`[Send #${msgNum}] Done — copy the encrypted output`)
 }
 
 function decrypt() {
   if (!recvChain.value || !ourRatchetKeyPair.value || !peerEncryptedInput.value.trim()) return
 
+  decryptedResult.value = null
   const msgNum = recvMessageCount.value + 1
   console.log('═══════════════════════════════════════════')
   console.log(`[Recv #${msgNum}] Decrypting with Double Ratchet...`)
@@ -652,8 +685,8 @@ function decrypt() {
   // 4. Build decrypted result
   const resultAttachments = payload.attachments?.map(a => {
     const bytes = base64ToBytes(a.data)
-    const blob = new Blob([bytes.buffer as ArrayBuffer], { type: a.mime })
-    return { type: a.type, blobUrl: createBlobUrl(blob) }
+    const blob = new Blob([bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer], { type: a.mime })
+    return { type: a.type, blobUrl: createBlobUrl(blob), name: a.name, size: bytes.byteLength }
   })
 
   decryptedResult.value = {
@@ -668,8 +701,22 @@ function decrypt() {
     attachments: resultAttachments,
   })
 
+  // Clear input so user can't accidentally decrypt again (ratchet has advanced)
+  peerEncryptedInput.value = ''
+
   playNotificationSound()
   console.log(`[Recv #${msgNum}] Done`)
+}
+
+// ─── Download ────────────────────────────────────────────────────
+
+function downloadFile(blobUrl: string, name: string) {
+  const a = document.createElement('a')
+  a.href = blobUrl
+  a.download = name
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
 }
 
 // ─── Clipboard ───────────────────────────────────────────────────
@@ -719,6 +766,7 @@ function resetAll() {
   joinMode.value = false
   joinResponseCode.value = ''
   connectionMode.value = 'manual'
+  zoomImageUrl.value = null
   attachments.length = 0
   // Clean up audio players
   for (const [k, el] of Object.entries(audioRefs)) {
@@ -742,7 +790,18 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="h-screen bg-gray-950 text-gray-100 flex flex-col overflow-hidden">
+  <div class="h-screen bg-gray-950 text-gray-100 flex flex-col overflow-hidden"
+    @keydown.escape="zoomImageUrl = null">
+
+    <!-- Image Zoom Modal -->
+    <div v-if="zoomImageUrl" class="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 cursor-pointer"
+      @click="zoomImageUrl = null">
+      <img :src="zoomImageUrl" class="max-w-[90vw] max-h-[90vh] object-contain rounded-lg shadow-2xl" @click.stop />
+      <button @click="zoomImageUrl = null"
+        class="absolute top-4 right-4 w-10 h-10 flex items-center justify-center rounded-full bg-gray-900/80 hover:bg-gray-800 text-xl transition-colors cursor-pointer">
+        &#x2715;
+      </button>
+    </div>
 
     <!-- Supabase Settings Panel -->
     <DbSettings
@@ -1071,40 +1130,67 @@ onBeforeUnmount(() => {
                 <div v-for="(att, j) in msg.attachments" :key="j">
 
                   <!-- Audio player -->
-                  <div v-if="att.type === 'audio'" class="flex items-center gap-2.5 min-w-[200px]">
-                    <audio :src="att.blobUrl"
-                      :ref="(el: any) => { if (el) initAudioState(`${msg.id}-${j}`, el) }"
-                      @loadedmetadata="onAudioMetadata(`${msg.id}-${j}`, $event.target as HTMLAudioElement)"
-                      @timeupdate="onAudioTimeUpdate(`${msg.id}-${j}`, $event.target as HTMLAudioElement)"
-                      @ended="onAudioEnded(`${msg.id}-${j}`)"
-                      preload="metadata"
-                      class="hidden" />
+                  <div v-if="att.type === 'audio'" class="space-y-1">
+                    <div class="flex items-center gap-2.5 min-w-[200px]">
+                      <audio :src="att.blobUrl"
+                        :ref="(el: any) => { if (el) initAudioState(`${msg.id}-${j}`, el) }"
+                        @loadedmetadata="onAudioMetadata(`${msg.id}-${j}`, $event.target as HTMLAudioElement)"
+                        @timeupdate="onAudioTimeUpdate(`${msg.id}-${j}`, $event.target as HTMLAudioElement)"
+                        @ended="onAudioEnded(`${msg.id}-${j}`)"
+                        preload="metadata"
+                        class="hidden" />
 
-                    <!-- Play/Pause -->
-                    <button @click="toggleAudio(`${msg.id}-${j}`)"
-                      class="w-8 h-8 flex items-center justify-center rounded-full shrink-0 cursor-pointer transition-colors"
-                      :class="msg.direction === 'sent' ? 'bg-blue-500 hover:bg-blue-400' : 'bg-gray-700 hover:bg-gray-600'">
-                      <span v-if="audioStates[`${msg.id}-${j}`]?.playing" class="text-sm leading-none">&#x23F8;</span>
-                      <span v-else class="text-[10px] leading-none ml-0.5">&#x25B6;</span>
-                    </button>
+                      <!-- Play/Pause -->
+                      <button @click="toggleAudio(`${msg.id}-${j}`)"
+                        class="w-8 h-8 flex items-center justify-center rounded-full shrink-0 cursor-pointer transition-colors"
+                        :class="msg.direction === 'sent' ? 'bg-blue-500 hover:bg-blue-400' : 'bg-gray-700 hover:bg-gray-600'">
+                        <span v-if="audioStates[`${msg.id}-${j}`]?.playing" class="text-sm leading-none">&#x23F8;</span>
+                        <span v-else class="text-[10px] leading-none ml-0.5">&#x25B6;</span>
+                      </button>
 
-                    <!-- Progress + Duration -->
-                    <div class="flex-1 min-w-0 space-y-1">
-                      <div class="h-1 rounded-full overflow-hidden"
-                        :class="msg.direction === 'sent' ? 'bg-blue-500/40' : 'bg-gray-600'">
-                        <div class="h-full rounded-full transition-[width] duration-200"
-                          :class="msg.direction === 'sent' ? 'bg-white/70' : 'bg-gray-400'"
-                          :style="{ width: audioProgress(`${msg.id}-${j}`) + '%' }" />
+                      <!-- Progress + Duration -->
+                      <div class="flex-1 min-w-0 space-y-1">
+                        <div class="h-1 rounded-full overflow-hidden"
+                          :class="msg.direction === 'sent' ? 'bg-blue-500/40' : 'bg-gray-600'">
+                          <div class="h-full rounded-full transition-[width] duration-200"
+                            :class="msg.direction === 'sent' ? 'bg-white/70' : 'bg-gray-400'"
+                            :style="{ width: audioProgress(`${msg.id}-${j}`) + '%' }" />
+                        </div>
+                        <span class="text-[10px] opacity-60">
+                          {{ formatTime(audioStates[`${msg.id}-${j}`]?.currentTime ?? 0) }}
+                          / {{ formatTime(audioStates[`${msg.id}-${j}`]?.duration ?? 0) }}
+                        </span>
                       </div>
-                      <span class="text-[10px] opacity-60">
-                        {{ formatTime(audioStates[`${msg.id}-${j}`]?.currentTime ?? 0) }}
-                        / {{ formatTime(audioStates[`${msg.id}-${j}`]?.duration ?? 0) }}
-                      </span>
                     </div>
+                    <button @click="downloadFile(att.blobUrl, att.name || 'audio.webm')"
+                      class="text-[10px] opacity-50 hover:opacity-80 transition-opacity cursor-pointer">
+                      &#x2B07; Save
+                    </button>
                   </div>
 
-                  <!-- Image -->
-                  <img v-else :src="att.blobUrl" class="max-h-48 rounded-lg object-contain" />
+                  <!-- Image (clickable for zoom) -->
+                  <div v-else-if="att.type === 'image'" class="space-y-1">
+                    <img :src="att.blobUrl" class="max-h-48 rounded-lg object-contain cursor-pointer hover:opacity-90 transition-opacity"
+                      @click="zoomImageUrl = att.blobUrl" />
+                    <button @click="downloadFile(att.blobUrl, att.name || 'image.png')"
+                      class="text-[10px] opacity-50 hover:opacity-80 transition-opacity cursor-pointer">
+                      &#x2B07; Save
+                    </button>
+                  </div>
+
+                  <!-- Generic file -->
+                  <div v-else class="flex items-center gap-2.5 min-w-[180px] py-1">
+                    <span class="text-2xl shrink-0">&#x1F4C4;</span>
+                    <div class="flex-1 min-w-0">
+                      <div class="text-sm truncate">{{ att.name || 'file' }}</div>
+                      <div class="text-[10px] opacity-50">{{ att.size ? formatSize(att.size) : '' }}</div>
+                    </div>
+                    <button @click="downloadFile(att.blobUrl, att.name || 'file')"
+                      class="w-7 h-7 flex items-center justify-center rounded-full shrink-0 cursor-pointer transition-colors"
+                      :class="msg.direction === 'sent' ? 'bg-blue-500 hover:bg-blue-400' : 'bg-gray-700 hover:bg-gray-600'">
+                      <span class="text-xs">&#x2B07;</span>
+                    </button>
+                  </div>
                 </div>
               </template>
             </div>
@@ -1125,9 +1211,15 @@ onBeforeUnmount(() => {
               <span class="text-xs text-gray-300">Voice · {{ formatSize(att.data.length) }}</span>
             </template>
             <!-- Image chip -->
-            <template v-else>
+            <template v-else-if="att.type === 'image'">
               <img :src="att.previewUrl" class="h-12 rounded object-contain" />
               <span class="text-xs text-gray-400">{{ formatSize(att.data.length) }}</span>
+            </template>
+            <!-- File chip -->
+            <template v-else>
+              <span class="text-sm">&#x1F4C4;</span>
+              <span class="text-xs text-gray-300 max-w-[120px] truncate">{{ att.name }}</span>
+              <span class="text-xs text-gray-500">{{ formatSize(att.data.length) }}</span>
             </template>
           </div>
         </div>
@@ -1142,7 +1234,7 @@ onBeforeUnmount(() => {
           <!-- Attach file -->
           <label class="flex items-center justify-center w-10 h-10 rounded-full hover:bg-gray-800 transition-colors cursor-pointer shrink-0">
             <span class="text-lg text-gray-400">&#x1F4CE;</span>
-            <input type="file" accept="image/*" multiple class="hidden" @change="onFileInput" />
+            <input type="file" multiple class="hidden" @change="onFileInput" />
           </label>
 
           <!-- Text input -->
@@ -1229,18 +1321,32 @@ onBeforeUnmount(() => {
               <div v-for="(att, i) in decryptedResult.attachments" :key="i"
                 class="bg-gray-800 border border-gray-700 rounded-lg p-3">
                 <div v-if="att.type === 'audio'" class="space-y-2">
-                  <div class="flex items-center gap-2 text-sm">
-                    <span>&#x1F3A4;</span>
-                    <span class="font-medium">Voice message</span>
+                  <div class="flex items-center justify-between text-sm">
+                    <div class="flex items-center gap-2">
+                      <span>&#x1F3A4;</span>
+                      <span class="font-medium">Voice message</span>
+                    </div>
+                    <button @click="downloadFile(att.blobUrl, att.name || 'audio.webm')" class="text-xs text-gray-400 hover:text-gray-200 cursor-pointer">&#x2B07; Save</button>
                   </div>
                   <audio :src="att.blobUrl" controls class="w-full" />
                 </div>
-                <div v-else class="space-y-2">
-                  <div class="flex items-center gap-2 text-sm">
-                    <span>&#x1F5BC;</span>
-                    <span class="font-medium">Image</span>
+                <div v-else-if="att.type === 'image'" class="space-y-2">
+                  <div class="flex items-center justify-between text-sm">
+                    <div class="flex items-center gap-2">
+                      <span>&#x1F5BC;</span>
+                      <span class="font-medium">Image</span>
+                    </div>
+                    <button @click="downloadFile(att.blobUrl, att.name || 'image.png')" class="text-xs text-gray-400 hover:text-gray-200 cursor-pointer">&#x2B07; Save</button>
                   </div>
-                  <img :src="att.blobUrl" class="max-h-80 rounded-lg object-contain" />
+                  <img :src="att.blobUrl" class="max-h-80 rounded-lg object-contain cursor-pointer hover:opacity-90" @click="zoomImageUrl = att.blobUrl" />
+                </div>
+                <div v-else class="flex items-center justify-between">
+                  <div class="flex items-center gap-2 text-sm min-w-0">
+                    <span>&#x1F4C4;</span>
+                    <span class="font-medium truncate">{{ att.name || 'file' }}</span>
+                    <span class="text-xs text-gray-500 shrink-0">{{ att.size ? formatSize(att.size) : '' }}</span>
+                  </div>
+                  <button @click="downloadFile(att.blobUrl, att.name || 'file')" class="text-xs text-gray-400 hover:text-gray-200 cursor-pointer shrink-0 ml-2">&#x2B07; Save</button>
                 </div>
               </div>
             </div>
