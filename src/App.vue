@@ -52,7 +52,7 @@ const connectionMode = ref<'manual' | 'supabase'>('manual')
 const soundEnabled = useLocalStorage('xchat-sound-enabled', true)
 
 // Attachments (multiple)
-const MAX_FILE_SIZE = 5 * 1024 * 1024 // 5 MB
+const MAX_FILE_SIZE = 100 * 1024 * 1024 // 100 MB (chunked transfer handles large files)
 
 interface UIAttachment {
   id: number
@@ -207,9 +207,17 @@ const statusText = computed(() => {
 
 const isSending = ref(false)
 
+// Progress tracking for large files
+const sendProgress = ref<{ text: string; percent: number } | null>(null)
+
 const canEncrypt = computed(() => {
   return !isSending.value && (attachments.length > 0 || plaintextInput.value.trim().length > 0)
 })
+
+// Yield to UI thread between heavy operations
+function yieldToUI(): Promise<void> {
+  return new Promise(r => setTimeout(r, 0))
+}
 
 // ─── Notification Sound ──────────────────────────────────────────
 
@@ -569,6 +577,9 @@ async function encrypt() {
   isSending.value = true
 
   const msgNum = sendMessageCount.value + 1
+  const totalDataSize = attachments.reduce((sum, a) => sum + a.data.length, 0)
+  const isLarge = totalDataSize > 512 * 1024 // show progress for >512KB
+
   console.log('═══════════════════════════════════════════')
   console.log(`[Send #${msgNum}] Encrypting with Double Ratchet...`)
   console.log('═══════════════════════════════════════════')
@@ -579,6 +590,8 @@ async function encrypt() {
   const prevSendMessageCount = sendMessageCount.value
 
   // 1. Symmetric ratchet → message key
+  if (isLarge) { sendProgress.value = { text: 'Preparing...', percent: 0 }; await yieldToUI() }
+
   const { nextChainKey, messageKey } = ratchetStep(sendChain.value)
 
   // 2. Generate new ephemeral ratchet key pair
@@ -586,6 +599,8 @@ async function encrypt() {
   console.log(`[Send #${msgNum}] New ephemeral ratchet key generated`)
 
   // 3. Build JSON payload
+  if (isLarge) { sendProgress.value = { text: 'Encoding...', percent: 5 }; await yieldToUI() }
+
   const payloadAttachments: Attachment[] = attachments.map(a => ({
     type: a.type,
     mime: a.mime,
@@ -604,6 +619,8 @@ async function encrypt() {
   }
 
   // 4. Encrypt
+  if (isLarge) { sendProgress.value = { text: 'Encrypting...', percent: 20 }; await yieldToUI() }
+
   console.log('[Send] JSON payload before encryption:', JSON.stringify(payload, null, 2))
   const encrypted = encryptMessage(messageKey, payload)
   encryptedOutput.value = encrypted
@@ -617,7 +634,12 @@ async function encrypt() {
 
   // 6. Auto-send to Supabase if configured — await and rollback on failure
   if (db.isConfigured.value) {
-    const ok = await db.sendMessage(encrypted)
+    if (isLarge) { sendProgress.value = { text: 'Uploading...', percent: 30 }; await yieldToUI() }
+
+    const ok = await db.sendMessage(encrypted, (sent, total) => {
+      const uploadPercent = 30 + Math.round((sent / total) * 70)
+      sendProgress.value = { text: `Uploading ${sent}/${total}...`, percent: uploadPercent }
+    })
     if (!ok) {
       console.error(`[Send #${msgNum}] Supabase send failed — rolling back ratchet`)
       sendChain.value = prevSendChain
@@ -625,6 +647,7 @@ async function encrypt() {
       sendMessageCount.value = prevSendMessageCount
       encryptedOutput.value = ''
       isSending.value = false
+      sendProgress.value = null
       return
     }
     console.log(`[Send #${msgNum}] Auto-sent to Supabase`)
@@ -648,6 +671,7 @@ async function encrypt() {
   plaintextInput.value = ''
   attachments.length = 0
   isSending.value = false
+  sendProgress.value = null
   console.log(`[Send #${msgNum}] Done — copy the encrypted output`)
 }
 
@@ -1221,6 +1245,30 @@ onBeforeUnmount(() => {
               <span class="text-xs text-gray-300 max-w-[120px] truncate">{{ att.name }}</span>
               <span class="text-xs text-gray-500">{{ formatSize(att.data.length) }}</span>
             </template>
+          </div>
+        </div>
+
+        <!-- Send progress bar -->
+        <div v-if="sendProgress" class="px-4 py-2 border-t border-gray-800 bg-gray-900/50 shrink-0">
+          <div class="flex items-center justify-between text-xs text-gray-400 mb-1">
+            <span>{{ sendProgress.text }}</span>
+            <span>{{ sendProgress.percent }}%</span>
+          </div>
+          <div class="h-1.5 bg-gray-800 rounded-full overflow-hidden">
+            <div class="h-full bg-blue-500 rounded-full transition-[width] duration-300"
+              :style="{ width: sendProgress.percent + '%' }" />
+          </div>
+        </div>
+
+        <!-- Chunk receiving progress -->
+        <div v-if="db.chunkProgress.value" class="px-4 py-2 border-t border-gray-800 bg-gray-900/50 shrink-0">
+          <div class="flex items-center justify-between text-xs text-gray-400 mb-1">
+            <span>Receiving file {{ db.chunkProgress.value.received }}/{{ db.chunkProgress.value.total }}...</span>
+            <span>{{ Math.round((db.chunkProgress.value.received / db.chunkProgress.value.total) * 100) }}%</span>
+          </div>
+          <div class="h-1.5 bg-gray-800 rounded-full overflow-hidden">
+            <div class="h-full bg-emerald-500 rounded-full transition-[width] duration-300"
+              :style="{ width: (db.chunkProgress.value.received / db.chunkProgress.value.total * 100) + '%' }" />
           </div>
         </div>
 

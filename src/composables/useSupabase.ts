@@ -1,9 +1,11 @@
 import { ref, computed, type Ref } from 'vue'
 import { useLocalStorage } from '@vueuse/core'
 import { createClient, type SupabaseClient, type RealtimeChannel } from '@supabase/supabase-js'
-import type { DbSettings, DbConnectionState, DbMessageEnvelope, DbMessageRow } from '../types/db'
+import type { DbSettings, DbConnectionState, DbMessageEnvelope, DbChunkEnvelope, DbMessageRow } from '../types/db'
 
 const REALTIME_BACKUP_INTERVAL = 5 * 60 * 1000 // 5 minutes
+const CHUNK_SIZE = 750_000 // ~750KB base64 chars per chunk (safe for Realtime + API)
+const CHUNK_TIMEOUT = 5 * 60 * 1000 // 5 min — discard incomplete chunks after this
 
 const DEFAULT_SETTINGS: DbSettings = {
   url: '',
@@ -40,6 +42,32 @@ export function useSupabase(options: {
   )
   const isSyncing = ref(false)
   const isListening = ref(false)
+
+  // Chunk receiving progress (exposed for UI)
+  const chunkProgress = ref<{ mid: string; received: number; total: number } | null>(null)
+
+  // ─── Chunk Reassembly Buffer ───────────────────────────────
+  // Map<mid, { total, receivedAt, chunks: Map<seq, data>, pks: (string|number)[] }>
+  const chunkBuffer = new Map<string, {
+    total: number
+    receivedAt: number
+    chunks: Map<number, string>
+    pks: (string | number)[]
+  }>()
+
+  function cleanupStaleChunks() {
+    const now = Date.now()
+    for (const [mid, buf] of chunkBuffer) {
+      if (now - buf.receivedAt > CHUNK_TIMEOUT) {
+        console.warn(`[Supabase] Chunk buffer expired for mid=${mid} (${buf.chunks.size}/${buf.total} received)`)
+        // Delete stale chunk rows from DB
+        for (const pk of buf.pks) {
+          deleteMessage(pk)
+        }
+        chunkBuffer.delete(mid)
+      }
+    }
+  }
 
   // ─── Connect ─────────────────────────────────────────────
   async function connect(): Promise<boolean> {
@@ -96,6 +124,7 @@ export function useSupabase(options: {
     connectionError.value = ''
     tables.value = []
     columns.value = []
+    chunkBuffer.clear()
     console.log('[Supabase] Disconnected')
   }
 
@@ -137,10 +166,24 @@ export function useSupabase(options: {
     }
   }
 
-  // ─── Send Message ───────────────────────────────────────
-  async function sendMessage(encryptedBase64: string): Promise<boolean> {
+  // ─── Send Message (auto-chunks if needed) ──────────────
+  async function sendMessage(
+    encryptedBase64: string,
+    onProgress?: (sent: number, total: number) => void
+  ): Promise<boolean> {
     if (!client || !isConfigured.value || !options.fingerprint.value) return false
 
+    // If small enough, send as single message
+    if (encryptedBase64.length <= CHUNK_SIZE) {
+      onProgress?.(1, 1)
+      return sendSingleMessage(encryptedBase64)
+    }
+
+    // Otherwise, split into chunks
+    return sendChunked(encryptedBase64, onProgress)
+  }
+
+  async function sendSingleMessage(encryptedBase64: string): Promise<boolean> {
     const envelope: DbMessageEnvelope = {
       s: options.fingerprint.value,
       d: encryptedBase64,
@@ -148,7 +191,7 @@ export function useSupabase(options: {
 
     const row = { [settings.value.column]: JSON.stringify(envelope) }
 
-    const { error } = await client.from(settings.value.table).insert(row)
+    const { error } = await client!.from(settings.value.table).insert(row)
     if (error) {
       console.error('[Supabase] Insert failed:', error.message)
       return false
@@ -158,9 +201,116 @@ export function useSupabase(options: {
     return true
   }
 
+  async function sendChunked(
+    encryptedBase64: string,
+    onProgress?: (sent: number, total: number) => void
+  ): Promise<boolean> {
+    const mid = Math.random().toString(36).slice(2, 8)
+    const totalChunks = Math.ceil(encryptedBase64.length / CHUNK_SIZE)
+    const BATCH_SIZE = 10
+
+    console.log(`[Supabase] Sending chunked message: mid=${mid}, ${totalChunks} chunks, total ${encryptedBase64.length} chars`)
+
+    // Build all chunk rows
+    const allRows: Record<string, string>[] = []
+    for (let seq = 0; seq < totalChunks; seq++) {
+      const start = seq * CHUNK_SIZE
+      const chunkData = encryptedBase64.slice(start, start + CHUNK_SIZE)
+
+      const envelope: DbChunkEnvelope = {
+        s: options.fingerprint.value,
+        t: 'chunk',
+        mid,
+        seq,
+        total: totalChunks,
+        d: chunkData,
+      }
+
+      allRows.push({ [settings.value.column]: JSON.stringify(envelope) })
+    }
+
+    // Send in batches for progress + reliability
+    let sent = 0
+    for (let i = 0; i < allRows.length; i += BATCH_SIZE) {
+      const batch = allRows.slice(i, i + BATCH_SIZE)
+      const { error } = await client!.from(settings.value.table).insert(batch)
+      if (error) {
+        console.error(`[Supabase] Chunked insert failed at batch ${Math.floor(i / BATCH_SIZE) + 1}:`, error.message)
+        return false
+      }
+      sent += batch.length
+      onProgress?.(sent, totalChunks)
+      console.log(`[Supabase] Chunks sent: ${sent}/${totalChunks} (mid=${mid})`)
+    }
+
+    console.log(`[Supabase] All ${totalChunks} chunks sent (mid=${mid})`)
+    return true
+  }
+
+  // ─── Process Incoming Row ─────────────────────────────────
+  // Returns: 'message' row for immediate delivery, 'chunk' buffered, or null if skipped
+  function processIncomingRow(rec: Record<string, any>): { type: 'message'; row: DbMessageRow } | { type: 'assembled'; data: string; pks: (string | number)[] } | null {
+    const { column, idColumn } = settings.value
+    const raw = rec[column]
+    if (!raw) return null
+
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw
+
+    // Skip our own messages
+    if (parsed.s === options.fingerprint.value) return null
+
+    // Chunk envelope
+    if (parsed.t === 'chunk') {
+      const chunk = parsed as DbChunkEnvelope
+      const pk = rec[idColumn]
+
+      let buf = chunkBuffer.get(chunk.mid)
+      if (!buf) {
+        buf = { total: chunk.total, receivedAt: Date.now(), chunks: new Map(), pks: [] }
+        chunkBuffer.set(chunk.mid, buf)
+      }
+
+      buf.chunks.set(chunk.seq, chunk.d)
+      buf.pks.push(pk)
+      buf.receivedAt = Date.now()
+
+      console.log(`[Supabase] Chunk ${chunk.seq + 1}/${chunk.total} for mid=${chunk.mid}`)
+
+      // Update progress for UI
+      chunkProgress.value = { mid: chunk.mid, received: buf.chunks.size, total: buf.total }
+
+      // Check if complete
+      if (buf.chunks.size === buf.total) {
+        // Reassemble in order
+        let assembled = ''
+        for (let i = 0; i < buf.total; i++) {
+          assembled += buf.chunks.get(i) || ''
+        }
+        const pks = [...buf.pks]
+        chunkBuffer.delete(chunk.mid)
+        chunkProgress.value = null
+
+        console.log(`[Supabase] All chunks received for mid=${chunk.mid} — assembled ${assembled.length} chars`)
+        return { type: 'assembled', data: assembled, pks }
+      }
+
+      return null // Still waiting for more chunks
+    }
+
+    // Regular message envelope
+    if (parsed.s && parsed.d) {
+      return { type: 'message', row: { pk: rec[idColumn], data: raw } }
+    }
+
+    return null
+  }
+
   // ─── Poll Messages ──────────────────────────────────────
   async function pollOnce() {
     if (!client || !isConfigured.value || !options.fingerprint.value) return
+
+    // Cleanup stale chunk buffers
+    cleanupStaleChunks()
 
     const { table, column, idColumn } = settings.value
 
@@ -180,12 +330,22 @@ export function useSupabase(options: {
     for (const row of data) {
       try {
         const rec = row as Record<string, any>
-        const raw = rec[column]
-        const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw
+        const result = processIncomingRow(rec)
+        if (!result) continue
 
-        const envelope = parsed as DbMessageEnvelope
-        if (envelope.s && envelope.s !== options.fingerprint.value) {
-          incoming.push({ pk: rec[idColumn], data: raw })
+        if (result.type === 'message') {
+          incoming.push(result.row)
+        } else if (result.type === 'assembled') {
+          // Create a synthetic message row with the reassembled data
+          const envelope: DbMessageEnvelope = {
+            s: '', // fingerprint already checked in processIncomingRow
+            d: result.data,
+          }
+          incoming.push({ pk: result.pks[0]!, data: JSON.stringify(envelope) })
+          // Delete all chunk rows from DB
+          for (const pk of result.pks) {
+            deleteMessage(pk)
+          }
         }
       } catch {
         // skip malformed rows
@@ -243,7 +403,7 @@ export function useSupabase(options: {
   function tryRealtime() {
     if (!client || !isConfigured.value || !options.fingerprint.value) return
 
-    const { table, column, idColumn } = settings.value
+    const { table } = settings.value
 
     realtimeChannel = client
       .channel(`xchat-${table}`)
@@ -252,17 +412,24 @@ export function useSupabase(options: {
         { event: 'INSERT', schema: 'public', table },
         (payload) => {
           try {
-            const row = payload.new as Record<string, any>
-            const raw = row[column]
-            if (!raw) return
+            const rec = payload.new as Record<string, any>
+            const result = processIncomingRow(rec)
+            if (!result) return
 
-            const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw
-
-            if (parsed.s === options.fingerprint.value) return
-
-            console.log('[Supabase] Realtime: new message received')
-            const incoming: DbMessageRow = { pk: row[idColumn], data: raw }
-            options.onMessages([incoming])
+            if (result.type === 'message') {
+              console.log('[Supabase] Realtime: new message received')
+              options.onMessages([result.row])
+            } else if (result.type === 'assembled') {
+              console.log('[Supabase] Realtime: chunked message fully assembled')
+              const envelope: DbMessageEnvelope = {
+                s: '',
+                d: result.data,
+              }
+              options.onMessages([{ pk: result.pks[0]!, data: JSON.stringify(envelope) }])
+              for (const pk of result.pks) {
+                deleteMessage(pk)
+              }
+            }
           } catch {
             // skip malformed realtime events
           }
@@ -311,6 +478,7 @@ export function useSupabase(options: {
     isSyncing.value = false
     stopRealtime()
     stopPollLoop()
+    chunkBuffer.clear()
     console.log('[Supabase] Sync stopped')
   }
 
@@ -322,6 +490,7 @@ export function useSupabase(options: {
     isConfigured,
     isSyncing,
     isListening,
+    chunkProgress,
     tables,
     columns,
 
