@@ -1061,7 +1061,7 @@ onBeforeUnmount(() => {
       <div class="flex flex-col min-h-0" :class="connectionMode === 'supabase' ? 'w-full max-w-2xl mx-auto h-full' : 'w-full lg:w-1/2 h-[60vh] lg:h-auto'">
 
         <!-- Message list -->
-        <div ref="messageListRef" class="flex-1 overflow-y-auto min-h-0 p-4 space-y-2">
+        <div ref="messageListRef" class="flex-1 overflow-y-auto min-h-0 p-4 space-y-2 bg-gray-900">
           <!-- Empty state -->
           <div v-if="messages.length === 0" class="h-full flex items-center justify-center">
             <span class="text-sm text-gray-600">No messages yet</span>

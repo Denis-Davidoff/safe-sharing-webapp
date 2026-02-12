@@ -1,4 +1,4 @@
-package com.xchat.app
+package com.xchat.messenger
 
 import android.os.Bundle
 import androidx.activity.enableEdgeToEdge
