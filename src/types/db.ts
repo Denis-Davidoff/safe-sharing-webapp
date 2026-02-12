@@ -4,6 +4,7 @@ export interface DbSettings {
   table: string      // Table name
   column: string     // Column for encrypted message
   idColumn: string   // Primary key column (default: 'id')
+  senderColumn: string // Column for sender fingerprint (server-side filtering)
   pollInterval: number // ms
 }
 

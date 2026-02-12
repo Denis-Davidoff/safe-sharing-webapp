@@ -13,11 +13,13 @@ const DEFAULT_SETTINGS: DbSettings = {
   table: '',
   column: '',
   idColumn: 'id',
+  senderColumn: 'sender',
   pollInterval: 30000,
 }
 
 export function useSupabase(options: {
   fingerprint: Ref<string>
+  peerFingerprint: Ref<string>
   onMessages: (messages: DbMessageRow[]) => void
 }) {
   // ─── Persisted Settings ──────────────────────────────────
@@ -189,7 +191,10 @@ export function useSupabase(options: {
       d: encryptedBase64,
     }
 
-    const row = { [settings.value.column]: JSON.stringify(envelope) }
+    const row: Record<string, string> = { [settings.value.column]: JSON.stringify(envelope) }
+    if (settings.value.senderColumn) {
+      row[settings.value.senderColumn] = options.fingerprint.value
+    }
 
     const { error } = await client!.from(settings.value.table).insert(row)
     if (error) {
@@ -226,7 +231,11 @@ export function useSupabase(options: {
         d: chunkData,
       }
 
-      allRows.push({ [settings.value.column]: JSON.stringify(envelope) })
+      const row: Record<string, string> = { [settings.value.column]: JSON.stringify(envelope) }
+      if (settings.value.senderColumn) {
+        row[settings.value.senderColumn] = options.fingerprint.value
+      }
+      allRows.push(row)
     }
 
     // Send in batches for progress + reliability
@@ -256,8 +265,8 @@ export function useSupabase(options: {
 
     const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw
 
-    // Skip our own messages
-    if (parsed.s === options.fingerprint.value) return null
+    // Only accept messages from our specific peer (ignore other chat pairs)
+    if (!options.peerFingerprint.value || parsed.s !== options.peerFingerprint.value) return null
 
     // Chunk envelope
     if (parsed.t === 'chunk') {
@@ -307,17 +316,24 @@ export function useSupabase(options: {
 
   // ─── Poll Messages ──────────────────────────────────────
   async function pollOnce() {
-    if (!client || !isConfigured.value || !options.fingerprint.value) return
+    if (!client || !isConfigured.value || !options.fingerprint.value || !options.peerFingerprint.value) return
 
     // Cleanup stale chunk buffers
     cleanupStaleChunks()
 
-    const { table, column, idColumn } = settings.value
+    const { table, column, idColumn, senderColumn } = settings.value
 
-    const { data, error } = await client
+    let query = client
       .from(table)
       .select(`${idColumn}, ${column}`)
       .order(idColumn, { ascending: true })
+
+    // Server-side filtering: only fetch rows from our peer
+    if (senderColumn && options.peerFingerprint.value) {
+      query = query.eq(senderColumn, options.peerFingerprint.value)
+    }
+
+    const { data, error } = await query
 
     if (error) {
       console.error('[Supabase] Poll failed:', error.message)

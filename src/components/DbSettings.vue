@@ -159,6 +159,16 @@ const stateColor: Record<DbConnectionState, string> = {
               placeholder="id"
               class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500" />
           </div>
+
+          <div class="space-y-1">
+            <label class="block text-xs text-gray-400">Sender column (for server-side filtering)</label>
+            <input type="text"
+              :value="settings.senderColumn"
+              @input="update('senderColumn', ($event.target as HTMLInputElement).value)"
+              placeholder="sender"
+              class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500" />
+            <p class="text-xs text-gray-600">Leave empty to skip server-side filtering</p>
+          </div>
         </div>
 
         <!-- Sync controls (only when configured + handshake done) -->
@@ -217,8 +227,12 @@ const stateColor: Record<DbConnectionState, string> = {
             <pre class="mt-2 bg-gray-800 rounded-lg p-3 overflow-x-auto text-gray-400 whitespace-pre">-- Create a messages table
 CREATE TABLE messages (
   id BIGSERIAL PRIMARY KEY,
-  payload TEXT
+  payload TEXT,
+  sender TEXT  -- fingerprint for server-side filtering
 );
+
+-- Index for fast sender filtering
+CREATE INDEX idx_messages_sender ON messages (sender);
 
 -- Enable RLS and allow all operations
 ALTER TABLE messages ENABLE ROW LEVEL SECURITY;

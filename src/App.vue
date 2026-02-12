@@ -263,8 +263,14 @@ const fingerprint = computed(() => {
   return encodeBase64(keyPair.value.publicKey).slice(0, 8)
 })
 
+const peerFingerprint = computed(() => {
+  if (!peerPublicKey.value) return ''
+  return encodeBase64(peerPublicKey.value).slice(0, 8)
+})
+
 const db = useSupabase({
   fingerprint,
+  peerFingerprint,
   onMessages: handleDbMessages,
 })
 
