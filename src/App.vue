@@ -62,6 +62,7 @@ interface SessionData {
   rn: number
   cm: 'manual' | 'supabase'
 }
+const autoSaveEnabled = useLocalStorage('xchat-autosave', true)
 const savedSession = useLocalStorage<SessionData | null>('xchat-session', null, {
   serializer: {
     read: (v: string): SessionData | null => { try { return JSON.parse(v) } catch { return null } },
@@ -341,6 +342,7 @@ function handleDbMessages(rows: DbMessageRow[]) {
 
       console.log(`[DB-Recv #${msgNum}] Decrypted and added to history`)
       playNotificationSound()
+      autoSave()
 
       // 5. Delete from DB
       db.deleteMessage(row.pk)
@@ -413,6 +415,8 @@ function completeHandshake() {
     if (db.isConfigured.value && !db.isSyncing.value) {
       db.startSync()
     }
+
+    autoSave()
   } catch (e) {
     console.error('[Handshake] Error:', e)
     alert('Invalid public key format.')
@@ -462,6 +466,15 @@ function saveSession() {
     console.log('[Session] Saved to localStorage')
   }
 }
+
+function autoSave() {
+  if (autoSaveEnabled.value) saveSession()
+}
+
+// When autosave is toggled on, immediately save current session
+watch(autoSaveEnabled, (on) => {
+  if (on && phase.value === 'ready') saveSession()
+})
 
 function loadSession() {
   if (!savedSession.value) return
@@ -744,6 +757,7 @@ async function encrypt() {
   attachments.length = 0
   isSending.value = false
   sendProgress.value = null
+  autoSave()
   console.log(`[Send #${msgNum}] Done — copy the encrypted output`)
 }
 
@@ -801,6 +815,7 @@ function decrypt() {
   peerEncryptedInput.value = ''
 
   playNotificationSound()
+  autoSave()
   console.log(`[Recv #${msgNum}] Done`)
 }
 
@@ -941,10 +956,11 @@ onBeforeUnmount(() => {
           <span v-if="soundEnabled" class="text-sm">&#x1F514;</span>
           <span v-else class="text-sm opacity-40">&#x1F515;</span>
         </button>
-        <button v-if="phase === 'ready'" @click="saveSession"
-          title="Save session"
+        <button v-if="phase === 'ready'" @click="autoSaveEnabled = !autoSaveEnabled"
+          :title="autoSaveEnabled ? 'Auto-save on (click to disable)' : 'Auto-save off (click to enable)'"
           class="w-7 h-7 flex items-center justify-center rounded-full hover:bg-gray-800 transition-colors cursor-pointer">
-          <span class="text-sm">&#x1F4BE;</span>
+          <span v-if="autoSaveEnabled" class="text-sm">&#x1F4BE;</span>
+          <span v-else class="text-sm opacity-40">&#x1F4BE;</span>
         </button>
         <button v-if="phase === 'ready'" @click="exportSession"
           title="Export session to clipboard"
