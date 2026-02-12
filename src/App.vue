@@ -49,6 +49,27 @@ const peerEncryptedInput = ref('')
 const connectionMode = ref<'manual' | 'supabase'>('manual')
 const soundEnabled = useLocalStorage('xchat-sound-enabled', true)
 
+// Session persistence
+interface SessionData {
+  v: 1
+  kp: { pub: string; sec: string }
+  peer: string
+  sc: string
+  rc: string
+  rkp: { pub: string; sec: string }
+  rp: string
+  sn: number
+  rn: number
+  cm: 'manual' | 'supabase'
+}
+const savedSession = useLocalStorage<SessionData | null>('xchat-session', null, {
+  serializer: {
+    read: (v: string): SessionData | null => { try { return JSON.parse(v) } catch { return null } },
+    write: (v: SessionData | null): string => JSON.stringify(v),
+  },
+})
+const hasSavedSession = computed(() => savedSession.value !== null)
+
 // Attachments (multiple)
 const MAX_FILE_SIZE = 100 * 1024 * 1024 // 100 MB (chunked transfer handles large files)
 
@@ -398,6 +419,79 @@ function completeHandshake() {
   }
 }
 
+// ─── Session Persistence ────────────────────────────────────────
+
+function serializeSession(): SessionData | null {
+  if (!keyPair.value || !peerPublicKey.value || !sendChain.value || !recvChain.value || !ourRatchetKeyPair.value || !peerRatchetPublic.value) return null
+  return {
+    v: 1,
+    kp: { pub: encodeBase64(keyPair.value.publicKey), sec: encodeBase64(keyPair.value.secretKey) },
+    peer: encodeBase64(peerPublicKey.value),
+    sc: encodeBase64(sendChain.value),
+    rc: encodeBase64(recvChain.value),
+    rkp: { pub: encodeBase64(ourRatchetKeyPair.value.publicKey), sec: encodeBase64(ourRatchetKeyPair.value.secretKey) },
+    rp: encodeBase64(peerRatchetPublic.value),
+    sn: sendMessageCount.value,
+    rn: recvMessageCount.value,
+    cm: connectionMode.value,
+  }
+}
+
+function restoreSession(data: SessionData) {
+  keyPair.value = { publicKey: decodeBase64(data.kp.pub), secretKey: decodeBase64(data.kp.sec) }
+  peerPublicKey.value = decodeBase64(data.peer)
+  sendChain.value = decodeBase64(data.sc)
+  recvChain.value = decodeBase64(data.rc)
+  ourRatchetKeyPair.value = { publicKey: decodeBase64(data.rkp.pub), secretKey: decodeBase64(data.rkp.sec) }
+  peerRatchetPublic.value = decodeBase64(data.rp)
+  sendMessageCount.value = data.sn
+  recvMessageCount.value = data.rn
+  connectionMode.value = data.cm
+  phase.value = 'ready'
+
+  if (db.isConfigured.value && !db.isSyncing.value) {
+    db.startSync()
+  }
+  console.log('[Session] Restored')
+}
+
+function saveSession() {
+  const data = serializeSession()
+  if (data) {
+    savedSession.value = data
+    console.log('[Session] Saved to localStorage')
+  }
+}
+
+function loadSession() {
+  if (!savedSession.value) return
+  restoreSession(savedSession.value)
+}
+
+function deleteSession() {
+  savedSession.value = null
+  console.log('[Session] Deleted from localStorage')
+}
+
+async function exportSession() {
+  const data = serializeSession()
+  if (data) {
+    await copyToClipboard(JSON.stringify(data))
+    console.log('[Session] Exported to clipboard')
+  }
+}
+
+async function importSession() {
+  const text = await navigator.clipboard.readText()
+  try {
+    const data: SessionData = JSON.parse(text.trim())
+    if (data.v !== 1 || !data.kp || !data.peer) throw new Error('Invalid format')
+    restoreSession(data)
+    savedSession.value = data
+  } catch {
+    alert('Invalid session data')
+  }
+}
 
 // ─── Voice Recording ─────────────────────────────────────────────
 
@@ -779,6 +873,7 @@ function resetAll() {
   db.stopSync()
   blobUrls.forEach(url => URL.revokeObjectURL(url))
   blobUrls.length = 0
+  deleteSession()
   console.log('[Reset] All state cleared')
 }
 
@@ -846,6 +941,16 @@ onBeforeUnmount(() => {
           <span v-if="soundEnabled" class="text-sm">&#x1F514;</span>
           <span v-else class="text-sm opacity-40">&#x1F515;</span>
         </button>
+        <button v-if="phase === 'ready'" @click="saveSession"
+          title="Save session"
+          class="w-7 h-7 flex items-center justify-center rounded-full hover:bg-gray-800 transition-colors cursor-pointer">
+          <span class="text-sm">&#x1F4BE;</span>
+        </button>
+        <button v-if="phase === 'ready'" @click="exportSession"
+          title="Export session to clipboard"
+          class="w-7 h-7 flex items-center justify-center rounded-full hover:bg-gray-800 transition-colors cursor-pointer">
+          <span class="text-sm">&#x1F4CB;</span>
+        </button>
         <button v-if="phase === 'ready'" @click="resetAll"
           class="text-xs text-red-400 hover:text-red-300 transition-colors cursor-pointer">
           Reset
@@ -892,6 +997,18 @@ onBeforeUnmount(() => {
             <button @click="startHandshake"
               class="w-full py-2.5 px-4 bg-gray-700 hover:bg-gray-600 rounded-lg font-medium transition-colors cursor-pointer">
               Join Existing Chat
+            </button>
+
+            <!-- Session restore -->
+            <div v-if="hasSavedSession" class="border-t border-gray-700 pt-3 mt-1">
+              <button @click="loadSession"
+                class="w-full py-2 px-4 bg-emerald-700 hover:bg-emerald-600 rounded-lg text-sm font-medium transition-colors cursor-pointer">
+                Resume Saved Session
+              </button>
+            </div>
+            <button @click="importSession"
+              class="w-full py-2 px-4 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg text-sm font-medium transition-colors cursor-pointer">
+              Import Session
             </button>
           </template>
 
@@ -1003,6 +1120,18 @@ onBeforeUnmount(() => {
                 Join Existing Chat
               </button>
               <p class="text-center text-xs text-gray-500">Messages will be delivered via Supabase after key exchange</p>
+
+              <!-- Session restore -->
+              <div v-if="hasSavedSession" class="border-t border-gray-700 pt-3 mt-1">
+                <button @click="loadSession"
+                  class="w-full py-2 px-4 bg-emerald-700 hover:bg-emerald-600 rounded-lg text-sm font-medium transition-colors cursor-pointer">
+                  Resume Saved Session
+                </button>
+              </div>
+              <button @click="importSession"
+                class="w-full py-2 px-4 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg text-sm font-medium transition-colors cursor-pointer">
+                Import Session
+              </button>
             </template>
 
           </template>
