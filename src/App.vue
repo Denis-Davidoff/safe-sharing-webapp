@@ -46,8 +46,6 @@ const peerPublicKeyInput = ref('')
 const plaintextInput = ref('')
 const encryptedOutput = ref('')
 const peerEncryptedInput = ref('')
-const joinMode = ref(false)
-const joinResponseCode = ref('')
 const connectionMode = ref<'manual' | 'supabase'>('manual')
 const soundEnabled = useLocalStorage('xchat-sound-enabled', true)
 
@@ -199,7 +197,7 @@ function onInputKeydown(e: KeyboardEvent) {
 
 const statusText = computed(() => {
   switch (phase.value) {
-    case 'idle': return joinMode.value ? 'Paste invite code to join' : 'Create or join a chat'
+    case 'idle': return 'Create or join a chat'
     case 'waiting': return 'Send invite code to your peer'
     case 'ready': return 'Secure channel established — send encrypted messages'
   }
@@ -334,6 +332,21 @@ function handleDbMessages(rows: DbMessageRow[]) {
 
 // ─── Handshake ───────────────────────────────────────────────────
 
+function goBack() {
+  if (phase.value === 'waiting') {
+    keyPair.value = null
+    peerPublicKeyInput.value = ''
+    phase.value = 'idle'
+  } else if (phase.value === 'idle' && connectionMode.value === 'supabase') {
+    if (db.isConfigured.value) {
+      db.settings.value.table = ''
+      db.settings.value.column = ''
+    } else if (db.isConnected.value) {
+      db.disconnect()
+    }
+  }
+}
+
 function startHandshake() {
   console.log('═══════════════════════════════════════════')
   console.log('[Phase 1] Generating ECDH key pair (Curve25519)...')
@@ -385,47 +398,6 @@ function completeHandshake() {
   }
 }
 
-function joinChat() {
-  if (!peerPublicKeyInput.value.trim()) return
-
-  console.log('═══════════════════════════════════════════')
-  console.log('[Join] Generating keys and completing handshake...')
-  console.log('═══════════════════════════════════════════')
-
-  try {
-    // 1. Generate our keys
-    keyPair.value = generateKeyPair()
-
-    // 2. Complete handshake with peer's invite key
-    const theirPub = decodeBase64(peerPublicKeyInput.value.trim())
-    peerPublicKey.value = theirPub
-
-    const shared = computeSharedSecret(keyPair.value.secretKey, theirPub)
-    const chains = deriveChainKeys(shared, keyPair.value.publicKey, theirPub)
-    sendChain.value = chains.sendChain
-    recvChain.value = chains.recvChain
-
-    ourRatchetKeyPair.value = { publicKey: keyPair.value.publicKey, secretKey: keyPair.value.secretKey }
-    peerRatchetPublic.value = theirPub
-
-    // 3. Store response code for user to copy back
-    joinResponseCode.value = encodeBase64(keyPair.value.publicKey)
-
-    // 4. Start Supabase sync if configured
-    if (db.isConfigured.value && !db.isSyncing.value) {
-      db.startSync()
-    }
-
-    // 5. Go to ready (joiner has both keys)
-    phase.value = 'ready'
-    joinMode.value = false
-
-    console.log('[Join] Secure channel established! Response code ready to copy.')
-  } catch (e) {
-    console.error('[Join] Error:', e)
-    alert('Invalid invite code format.')
-  }
-}
 
 // ─── Voice Recording ─────────────────────────────────────────────
 
@@ -793,8 +765,6 @@ function resetAll() {
   encryptedOutput.value = ''
   peerEncryptedInput.value = ''
   decryptedResult.value = null
-  joinMode.value = false
-  joinResponseCode.value = ''
   connectionMode.value = 'manual'
   zoomImageUrl.value = null
   attachments.length = 0
@@ -886,10 +856,17 @@ onBeforeUnmount(() => {
     <!-- ═══ Handshake Panel (centered, before ready) ═══ -->
     <div v-if="phase !== 'ready'" class="flex-1 flex items-center justify-center p-4">
       <div class="w-full max-w-lg space-y-4 bg-gray-900 rounded-xl p-5 border border-gray-800">
-        <h2 class="text-lg font-semibold">Key Exchange (ECDH · Curve25519)</h2>
+        <div class="flex items-center gap-2">
+          <button v-if="phase === 'waiting' || (phase === 'idle' && connectionMode === 'supabase' && db.isConnected.value)"
+            @click="goBack"
+            class="text-gray-400 hover:text-gray-200 transition-colors cursor-pointer text-lg leading-none">
+            &larr;
+          </button>
+          <h2 class="text-lg font-semibold">Key Exchange (ECDH · Curve25519)</h2>
+        </div>
 
         <!-- idle: choice screen -->
-        <div v-if="phase === 'idle' && !joinMode" class="space-y-4">
+        <div v-if="phase === 'idle'" class="space-y-4">
 
           <!-- Mode tabs -->
           <div class="flex rounded-lg bg-gray-800 p-0.5">
@@ -898,7 +875,7 @@ onBeforeUnmount(() => {
               class="flex-1 py-1.5 text-sm font-medium rounded-md transition-colors cursor-pointer">
               Copy / Paste
             </button>
-            <button @click="connectionMode = 'supabase'; joinMode = false"
+            <button @click="connectionMode = 'supabase'"
               :class="connectionMode === 'supabase' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-gray-200'"
               class="flex-1 py-1.5 text-sm font-medium rounded-md transition-colors cursor-pointer">
               Supabase
@@ -912,7 +889,7 @@ onBeforeUnmount(() => {
               Create New Chat
             </button>
             <div class="text-center text-sm text-gray-500">or</div>
-            <button @click="joinMode = true"
+            <button @click="startHandshake"
               class="w-full py-2.5 px-4 bg-gray-700 hover:bg-gray-600 rounded-lg font-medium transition-colors cursor-pointer">
               Join Existing Chat
             </button>
@@ -1021,7 +998,7 @@ onBeforeUnmount(() => {
                 Create New Chat
               </button>
               <div class="text-center text-sm text-gray-500">or</div>
-              <button @click="joinMode = true"
+              <button @click="startHandshake"
                 class="w-full py-2.5 px-4 bg-gray-700 hover:bg-gray-600 rounded-lg font-medium transition-colors cursor-pointer">
                 Join Existing Chat
               </button>
@@ -1031,40 +1008,7 @@ onBeforeUnmount(() => {
           </template>
         </div>
 
-        <!-- idle + joinMode: paste invite -->
-        <div v-if="phase === 'idle' && joinMode" class="space-y-4">
-          <div class="flex items-center gap-2">
-            <button @click="joinMode = false"
-              class="text-sm text-gray-400 hover:text-gray-200 transition-colors cursor-pointer">
-              &larr; Back
-            </button>
-            <h3 class="text-sm font-medium">Join Chat</h3>
-          </div>
-
-          <div class="space-y-1.5">
-            <label class="block text-sm text-gray-400">Paste Invite Code</label>
-            <div class="flex gap-2">
-              <textarea
-                v-model="peerPublicKeyInput"
-                placeholder="Paste invite code from your partner..."
-                class="flex-1 bg-gray-800 border border-gray-700 rounded-lg p-3 text-sm font-mono resize-none h-20 focus:outline-none focus:border-green-500"
-              />
-              <button
-                @click="pasteFromClipboard('peerKey')"
-                class="px-4 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm font-medium transition-colors shrink-0 cursor-pointer">
-                Paste
-              </button>
-            </div>
-          </div>
-
-          <button @click="joinChat"
-            :disabled="!peerPublicKeyInput.trim()"
-            class="w-full py-2.5 px-4 bg-green-600 hover:bg-green-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg font-medium transition-colors cursor-pointer disabled:cursor-not-allowed">
-            Join
-          </button>
-        </div>
-
-        <!-- waiting: initiator view (always manual key exchange) -->
+        <!-- waiting: key exchange view (same for create & join) -->
         <div v-if="phase === 'waiting'" class="space-y-4">
           <div class="space-y-1.5">
             <label class="block text-sm text-gray-400">Your Invite Code</label>
@@ -1109,22 +1053,6 @@ onBeforeUnmount(() => {
 
     <!-- ═══ Chat View (when ready) ═══ -->
     <template v-else>
-
-      <!-- Response code banner (shown after joining, dismissible) -->
-      <div v-if="joinResponseCode" class="bg-yellow-900/30 border-b border-yellow-800 px-4 py-3 shrink-0">
-        <p class="text-sm text-yellow-300 mb-2">Send this response code back to your partner:</p>
-        <div class="flex items-center gap-2">
-          <code class="flex-1 bg-gray-800 border border-gray-700 rounded px-3 py-2 text-xs font-mono truncate">{{ joinResponseCode }}</code>
-          <button @click="copyToClipboard(joinResponseCode)"
-            class="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-sm font-medium transition-colors cursor-pointer shrink-0">
-            Copy
-          </button>
-          <button @click="joinResponseCode = ''"
-            class="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded text-sm text-gray-400 transition-colors cursor-pointer shrink-0">
-            Dismiss
-          </button>
-        </div>
-      </div>
 
       <!-- Split Layout -->
       <div class="flex-1 flex flex-col lg:flex-row min-h-0" :class="connectionMode === 'supabase' ? 'justify-center' : ''">
