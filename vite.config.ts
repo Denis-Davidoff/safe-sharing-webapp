@@ -6,6 +6,7 @@ const host = process.env.TAURI_DEV_HOST
 
 // https://vite.dev/config/
 export default defineConfig({
+  base: process.env.TAURI_DEV_HOST !== undefined || process.env.TAURI_ENV_ARCH ? '/' : '/safe-sharing-webapp/',
   plugins: [vue(), tailwindcss()],
   clearScreen: false,
   server: {
